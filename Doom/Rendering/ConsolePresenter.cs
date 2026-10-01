@@ -70,17 +70,7 @@ internal sealed class ConsolePresenter
                 // поэтому текст статуса был невидим. Теперь символ ячейки берётся из буфера,
                 // а «▀» используется для всех ячеек игрового поля (так же, как раньше).
                 char cell = framebuffer.Chars[index];
-
-                if (cell < 0x80)
-                {
-                    _buffer[_position++] = (byte)cell;
-                }
-                else
-                {
-                    _buffer[_position++] = 0xE2;
-                    _buffer[_position++] = 0x96;
-                    _buffer[_position++] = 0x80;
-                }
+                EmitChar(cell);
             }
 
             if (y < rows - 1)
@@ -114,6 +104,30 @@ internal sealed class ConsolePresenter
         _buffer[_position++] = (byte)';';
         EmitInt(ColorRgb.Blue(color));
         _buffer[_position++] = (byte)'m';
+    }
+
+    /// <summary>
+    ///     Кодирует символ ячейки в UTF-8: ASCII, кириллица меню и рамки выводятся одинаково
+    ///     (раньше все не-ASCII символы заменялись на «▀»).
+    /// </summary>
+    private void EmitChar(char value)
+    {
+        if (value < 0x80)
+        {
+            _buffer[_position++] = (byte)value;
+            return;
+        }
+
+        if (value < 0x800)
+        {
+            _buffer[_position++] = (byte)(0xC0 | (value >> 6));
+            _buffer[_position++] = (byte)(0x80 | (value & 0x3F));
+            return;
+        }
+
+        _buffer[_position++] = (byte)(0xE0 | (value >> 12));
+        _buffer[_position++] = (byte)(0x80 | ((value >> 6) & 0x3F));
+        _buffer[_position++] = (byte)(0x80 | (value & 0x3F));
     }
 
     private void EmitInt(int value)

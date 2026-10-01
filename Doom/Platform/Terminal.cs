@@ -12,6 +12,9 @@ internal sealed class Terminal
 {
     private readonly Stream _stdout;
 
+    private uint _originalInputMode;
+    private bool _inputModeSaved;
+
     public Terminal()
     {
         try
@@ -76,6 +79,57 @@ internal sealed class Terminal
         }
     }
 
+    /// <summary>
+    ///     Отключает режим QuickEdit: иначе клик мышью в классической консоли выделяет текст и
+    ///     останавливает игру до нажатия клавиши, из-за чего стрелять мышью было бы нельзя.
+    /// </summary>
+    public void DisableQuickEdit()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            IntPtr handle = NativeMethods.GetStdHandle(NativeMethods.StdInputHandle);
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+                return;
+
+            if (!NativeMethods.GetConsoleMode(handle, out uint mode))
+                return;
+
+            _originalInputMode = mode;
+            _inputModeSaved = true;
+
+            uint updated = (mode & ~NativeMethods.EnableQuickEditMode) | NativeMethods.EnableExtendedFlags;
+            NativeMethods.SetConsoleMode(handle, updated);
+        }
+        catch
+        {
+            // Консоль может быть недоступна (перенаправленный ввод) — продолжаем играть.
+        }
+    }
+
+    /// <summary>Возвращает прежний режим ввода консоли (включая QuickEdit).</summary>
+    public void RestoreQuickEdit()
+    {
+        if (!OperatingSystem.IsWindows() || !_inputModeSaved)
+            return;
+
+        try
+        {
+            IntPtr handle = NativeMethods.GetStdHandle(NativeMethods.StdInputHandle);
+            if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+                NativeMethods.SetConsoleMode(handle, _originalInputMode);
+        }
+        catch
+        {
+        }
+        finally
+        {
+            _inputModeSaved = false;
+        }
+    }
+
     /// <summary>Пробует уменьшить размер шрифта консоли. Возвращает <c>false</c>, если не удалось.</summary>
     public bool TrySetFontSize(short size)
     {
@@ -107,6 +161,82 @@ internal sealed class Terminal
         }
     }
 
+    /// <summary>
+    ///     «Отдаляет» картинку при старте: уменьшает шрифт консольным API, а если это не дало
+    ///     видимого эффекта (Windows Terminal игнорирует такой способ) — многократно нажимает
+    ///     «Ctrl + −» за пользователя. Возвращает <c>false</c>, если ничего не вышло.
+    /// </summary>
+    public bool TryAutoZoomOut()
+    {
+        if (!OperatingSystem.IsWindows())
+            return false;
+
+        // В классической консоли шрифт задаётся напрямую — это самый надёжный путь.
+        if (!IsRunningInWindowsTerminal && TrySetSmallestFont())
+            return true;
+
+        // Windows Terminal игнорирует консольный API, поэтому жмём «Ctrl + −» за пользователя.
+        return TryZoomOutWithKeys();
+    }
+
+    /// <summary>
+    ///     Пытается поставить мелкий шрифт и подтверждает, что он действительно применился: успех
+    ///     считается только если окно стало вмещать больше колонок. Иначе возвращает <c>false</c>,
+    ///     чтобы вызывающий код перешёл к эмуляции «Ctrl + −» (иначе метод «врал» про успех).
+    /// </summary>
+    private bool TrySetSmallestFont()
+    {
+        ReadWindowSize(out int columnsBefore, out _);
+
+        for (short size = GameConfig.MinimumFontSize; size <= GameConfig.DesiredFontSize; size++)
+        {
+            if (!TrySetFontSize(size))
+                continue;
+
+            ReadWindowSize(out int columnsAfter, out _);
+            if (columnsAfter > columnsBefore)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    ///     Отправляет в активное окно <see cref="GameSettings.ZoomOutSteps" /> нажатий «Ctrl + −».
+    ///     Клавиатура (в отличие от колеса) всегда уходит в активное окно, поэтому приём срабатывает,
+    ///     даже если курсор не над терминалом. Успех проверяется по числу колонок: шрифт стал мельче —
+    ///     окно вмещает больше символов.
+    /// </summary>
+    private static bool TryZoomOutWithKeys()
+    {
+        int steps = GameSettings.Current.ZoomOutSteps;
+        if (steps <= 0)
+            return false;
+
+        ReadWindowSize(out int columnsBefore, out _);
+
+        var inputs = new NativeMethods.Input[steps * 2 + 2];
+        int count = 0;
+
+        inputs[count++] = NativeMethods.KeyInput(NativeMethods.VirtualKeyControl, keyUp: false);
+        for (int i = 0; i < steps; i++)
+        {
+            inputs[count++] = NativeMethods.KeyInput(NativeMethods.VirtualKeyOemMinus, keyUp: false);
+            inputs[count++] = NativeMethods.KeyInput(NativeMethods.VirtualKeyOemMinus, keyUp: true);
+        }
+
+        inputs[count++] = NativeMethods.KeyInput(NativeMethods.VirtualKeyControl, keyUp: true);
+
+        uint injected = NativeMethods.SendInput((uint)count, inputs, Marshal.SizeOf<NativeMethods.Input>());
+        if (injected != count)
+            return false;
+
+        Thread.Sleep(GameConfig.AutoZoomOutSettleMs);
+
+        ReadWindowSize(out int columnsAfter, out _);
+        return columnsAfter > columnsBefore;
+    }
+
     /// <summary>Просит терминал изменить размер окна.</summary>
     public void TryResize(int columns, int rows)
     {
@@ -129,6 +259,24 @@ internal sealed class Terminal
             columns = GameConfig.FallbackColumns;
             rows = GameConfig.FallbackRows;
         }
+    }
+
+    /// <summary>
+    ///     Показывает экран загрузки. Пока он на экране, игра успевает «отдалить» картинку,
+    ///     поэтому настройка масштаба (в том числе эмуляция «Ctrl + −») выглядит как загрузка.
+    /// </summary>
+    public void ShowLoadingScreen()
+    {
+        Write(Ansi.ClearScreen + Ansi.Home);
+
+        Console.WriteLine();
+        Console.WriteLine("        D O O M  —  консольный рейкастер");
+        Console.WriteLine();
+        Console.WriteLine("        Загрузка уровня…");
+        Console.WriteLine("        Настройка масштаба терминала…");
+        Console.WriteLine();
+        Console.WriteLine("        Мышь: обзор и огонь (ЛКМ) · WASD: шаги · Esc: выход");
+        Console.WriteLine();
     }
 
     /// <summary>

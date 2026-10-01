@@ -4,6 +4,7 @@ using Doom.Gameplay;
 using Doom.Input;
 using Doom.Platform;
 using Doom.Rendering;
+using Doom.UI;
 using Doom.World;
 
 namespace Doom.Core;
@@ -15,6 +16,8 @@ internal sealed class DoomGame
 {
     private readonly Terminal _terminal = new();
     private readonly KeyboardState _keyboard = new();
+    private readonly MouseState _mouse = new();
+    private readonly MenuController _menu = new();
     private readonly Level _level = Level.CreateDefault();
     private readonly Player _player = new();
     private readonly List<Pickup> _pickups = new();
@@ -28,6 +31,12 @@ internal sealed class DoomGame
     private Viewport _viewport;
     private double _previousFrameTime;
 
+    /// <summary>Текущий экран: геймплей или один из экранов меню.</summary>
+    private GameScreen _screen = GameScreen.Playing;
+
+    /// <summary>Запрошен выход из игры (пункт меню «Выход»).</summary>
+    private bool _quitRequested;
+
     /// <summary>Счётчик выстрелов: по нему считается детерминированный разброс дробинок.</summary>
     private int _shotCounter;
 
@@ -39,10 +48,20 @@ internal sealed class DoomGame
 
     public void Run()
     {
+        GameSettings.Load();
+
         if (!PrepareTerminal())
             return;
 
         _terminal.HideCursorAndClearScreen();
+
+        // Клик мышью не должен включать выделение текста и останавливать игру (QuickEdit в conhost).
+        _terminal.DisableQuickEdit();
+
+        // Левой кнопкой стреляем, движением — обзор; при захвате курсор удерживается на месте.
+        if (GameSettings.Current.CaptureMouse)
+            _mouse.BeginCapture();
+
         Console.CancelKeyPress += OnCancelKeyPress;
 
         _totalTimer.Restart();
@@ -55,17 +74,30 @@ internal sealed class DoomGame
         }
         finally
         {
+            GameSettings.Current.Save();
+            _mouse.EndCapture();
+            _terminal.RestoreQuickEdit();
             _terminal.Restore();
         }
     }
 
     /// <summary>
-    ///     Подбирает шрифт и размер окна. Возвращает <c>false</c>, если окно слишком маленькое.
+    ///     Настраивает терминал: показывает экран загрузки, «отдаляет» картинку и подбирает размер.
+    ///     Возвращает <c>false</c>, если окно слишком маленькое.
     /// </summary>
     private bool PrepareTerminal()
     {
-        bool fontChanged = _terminal.TrySetFontSize(GameConfig.DesiredFontSize);
-        _terminal.TryResize(GameConfig.DesiredColumns, GameConfig.DesiredRows);
+        // Загрузка скрывает «магию» с масштабом: пока она на экране, игра жмёт Ctrl+− за пользователя.
+        _terminal.ShowLoadingScreen();
+        Thread.Sleep(GameConfig.LoadingScreenMs);
+
+        bool zoomedOut = GameConfig.AutoZoomOut && _terminal.TryAutoZoomOut();
+        if (!zoomedOut)
+            _terminal.TrySetFontSize(GameConfig.DesiredFontSize);
+
+        // Окно увеличиваем, но НЕ уменьшаем: после «отдаления» шрифта то же окно вмещает больше
+        // символов, и запрос 320×100 наоборот сжал бы картинку.
+        GrowWindowToDesiredSize();
         Thread.Sleep(GameConfig.StartupDelayMs);
 
         Terminal.ReadWindowSize(out int columns, out int rows);
@@ -77,7 +109,8 @@ internal sealed class DoomGame
             return false;
         }
 
-        if (Terminal.IsRunningInWindowsTerminal && !fontChanged)
+        // Подсказку показываем только если «отдалить» автоматически не получилось.
+        if (!zoomedOut)
             _terminal.ShowZoomHint();
 
         // После подсказки и ресайза окно могло измениться — читаем размер ещё раз.
@@ -85,6 +118,24 @@ internal sealed class DoomGame
         Resize(columns, rows);
 
         return true;
+    }
+
+    /// <summary>
+    ///     Увеличивает окно до желаемого размера, но никогда не уменьшает его. Если текущее окно
+    ///     уже больше 320×100 (частый случай после «отдаления» шрифта), размер не трогается, поэтому
+    ///     картинка не сжимается.
+    /// </summary>
+    private void GrowWindowToDesiredSize()
+    {
+        Terminal.ReadWindowSize(out int columns, out int rows);
+
+        int targetColumns = Math.Max(columns, GameConfig.DesiredColumns);
+        int targetRows = Math.Max(rows, GameConfig.DesiredRows);
+
+        if (targetColumns == columns && targetRows == rows)
+            return;
+
+        _terminal.TryResize(targetColumns, targetRows);
     }
 
     /// <summary>Пересоздаёт буферы кадра под новый размер окна.</summary>
@@ -98,11 +149,13 @@ internal sealed class DoomGame
     private void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs args)
     {
         args.Cancel = false;
+        _mouse.EndCapture();
+        _terminal.RestoreQuickEdit();
         _terminal.Restore();
     }
 
-    /// <summary>Обрабатывает нажатия клавиш. Возвращает <c>true</c>, если игру нужно завершить.</summary>
-    private bool HandleKeys(long nowMs)
+    /// <summary>Обрабатывает нажатия клавиш во время игры.</summary>
+    private void HandleGameKeys(long nowMs)
     {
         double nowSeconds = nowMs / 1000.0;
 
@@ -113,8 +166,8 @@ internal sealed class DoomGame
             switch (key)
             {
                 case ConsoleKey.Escape:
-                    _terminal.Restore();
-                    return true;
+                    OpenMenu();
+                    return;
                 case ConsoleKey.OemMinus:
                 case ConsoleKey.Subtract:
                     _terminal.TrySetFontSize((short)Math.Max(
@@ -157,8 +210,6 @@ internal sealed class DoomGame
 
             _keyboard.MarkPressed(key, nowMs);
         }
-
-        return false;
     }
 
     /// <summary>Возвращает игрока в начало уровня и раскладывает бонусы заново.</summary>
@@ -190,7 +241,7 @@ internal sealed class DoomGame
         double lastAngle = double.NaN;
         bool hasRendered = false;
 
-        while (true)
+        while (!_quitRequested)
         {
             _frameTimer.Restart();
 
@@ -200,51 +251,124 @@ internal sealed class DoomGame
             long nowMs = Environment.TickCount64;
             double nowSeconds = nowMs / 1000.0;
 
-            if (HandleKeys(nowMs))
-                return;
+            _mouse.Update();
 
-            double elapsedSeconds = _totalTimer.Elapsed.TotalSeconds;
-            double deltaSeconds = elapsedSeconds - _previousFrameTime;
-            _previousFrameTime = elapsedSeconds;
+            if (_screen == GameScreen.Playing)
+                HandleGameKeys(nowMs);
 
-            if (deltaSeconds > GameConfig.MaxFrameSeconds)
-                deltaSeconds = GameConfig.MaxFrameSeconds;
-            if (deltaSeconds < 0)
-                deltaSeconds = 0;
+            bool redraw;
 
-            bool anyInput = UpdateWorld(deltaSeconds, nowSeconds, nowMs);
-
-            bool positionChanged = _player.X != lastX || _player.Y != lastY || _player.Angle != lastAngle;
-            bool animationRunning =
-                nowSeconds - _player.LastFireTime < GameConfig.WeaponAnimationSeconds ||
-                nowSeconds < _player.MuzzleFlashUntil ||
-                _player.IsRaisingWeapon(nowSeconds) ||
-                _player.BobIntensity > 0.001 ||
-                _projectiles.IsActive;
-
-            if (!hasRendered || anyInput || positionChanged || animationRunning)
+            if (_screen == GameScreen.Playing)
             {
-                lastX = _player.X;
-                lastY = _player.Y;
-                lastAngle = _player.Angle;
+                double elapsedSeconds = _totalTimer.Elapsed.TotalSeconds;
+                double deltaSeconds = elapsedSeconds - _previousFrameTime;
+                _previousFrameTime = elapsedSeconds;
 
-                _renderer.Render(
-                    _framebuffer,
-                    _viewport,
-                    _level,
-                    _player,
-                    _pickups,
-                    _projectiles,
-                    nowSeconds,
-                    _projectiles.FlashIntensity,
-                    _projectiles.FlashColor);
+                if (deltaSeconds > GameConfig.MaxFrameSeconds)
+                    deltaSeconds = GameConfig.MaxFrameSeconds;
+                if (deltaSeconds < 0)
+                    deltaSeconds = 0;
 
+                bool anyInput = UpdateWorld(deltaSeconds, nowSeconds, nowMs);
+
+                bool positionChanged = _player.X != lastX || _player.Y != lastY || _player.Angle != lastAngle;
+                bool animationRunning =
+                    nowSeconds - _player.LastFireTime < GameConfig.WeaponAnimationSeconds ||
+                    nowSeconds < _player.MuzzleFlashUntil ||
+                    _player.IsRaisingWeapon(nowSeconds) ||
+                    _player.BobIntensity > 0.001 ||
+                    _projectiles.IsActive;
+
+                redraw = !hasRendered || anyInput || positionChanged || animationRunning;
+
+                if (redraw)
+                {
+                    lastX = _player.X;
+                    lastY = _player.Y;
+                    lastAngle = _player.Angle;
+                }
+            }
+            else
+            {
+                redraw = !hasRendered || HandleMenuKeys();
+            }
+
+            if (redraw)
+            {
+                RenderFrame(nowSeconds);
                 _presenter.Present(_framebuffer);
                 hasRendered = true;
             }
 
             SleepToTargetFrameRate();
         }
+    }
+
+    /// <summary>Рисует кадр: сцену и, если открыто меню, наложение поверх неё.</summary>
+    private void RenderFrame(double nowSeconds)
+    {
+        _renderer.Render(
+            _framebuffer,
+            _viewport,
+            _level,
+            _player,
+            _pickups,
+            _projectiles,
+            nowSeconds,
+            _projectiles.FlashIntensity,
+            _projectiles.FlashColor);
+
+        if (_screen != GameScreen.Playing)
+            MenuRenderer.Draw(_framebuffer, _menu, _player);
+    }
+
+    /// <summary>Открывает меню-паузу и освобождает курсор, чтобы мышью можно было выбирать пункты.</summary>
+    private void OpenMenu()
+    {
+        _menu.Open();
+        _screen = GameScreen.MainMenu;
+        _mouse.EndCapture();
+    }
+
+    /// <summary>Обрабатывает нажатия в меню. Возвращает <c>true</c>, если нужна перерисовка.</summary>
+    private bool HandleMenuKeys()
+    {
+        bool redraw = false;
+
+        while (Console.KeyAvailable)
+        {
+            ConsoleKey key = Console.ReadKey(true).Key;
+
+            switch (_menu.HandleKey(key, _player))
+            {
+                case MenuCommand.Redraw:
+                    redraw = true;
+                    break;
+                case MenuCommand.Resume:
+                    ResumeGame();
+                    redraw = true;
+                    break;
+                case MenuCommand.Quit:
+                    _quitRequested = true;
+                    redraw = true;
+                    break;
+            }
+        }
+
+        return redraw;
+    }
+
+    /// <summary>Возвращает управление игре и применяет новые настройки (например, угол обзора).</summary>
+    private void ResumeGame()
+    {
+        _screen = GameScreen.Playing;
+        _viewport = new Viewport(_framebuffer.Columns, _framebuffer.Rows);
+        _previousFrameTime = _totalTimer.Elapsed.TotalSeconds;
+
+        GameSettings.Current.Save();
+
+        if (GameSettings.Current.CaptureMouse)
+            _mouse.BeginCapture();
     }
 
     /// <summary>Обновляет состояние игрока. Возвращает <c>true</c>, если игрок что-то сделал.</summary>
@@ -296,7 +420,15 @@ internal sealed class DoomGame
             anyInput = true;
         }
 
-        if (IsHeld(ConsoleKey.Spacebar, nowMs) && _player.TryFire(nowSeconds, out WeaponInfo info))
+        // Горизонтальный сдвиг мыши поворачивает камеру; левая кнопка стреляет (как Space).
+        if (_mouse.DeltaX != 0)
+        {
+            _player.Turn(_mouse.DeltaX * GameConfig.MouseSensitivity);
+            anyInput = true;
+        }
+
+        bool firePressed = IsHeld(ConsoleKey.Spacebar, nowMs) || _mouse.LeftButton;
+        if (firePressed && _player.TryFire(nowSeconds, out WeaponInfo info))
         {
             FireWeapon(info);
             anyInput = true;

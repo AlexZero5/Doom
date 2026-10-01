@@ -13,6 +13,9 @@ internal static class GameConfig
 
     public const double HalfFieldOfView = FieldOfView * 0.5;
 
+    /// <summary>Угол обзора в градусах — значение по умолчанию для настроек.</summary>
+    public const double FieldOfViewDegrees = FieldOfView * 180.0 / Math.PI;
+
     /// <summary>Количество вертикальных сэмплов текстуры стены.</summary>
     public const int TextureSamples = 2;
 
@@ -31,8 +34,8 @@ internal static class GameConfig
     // ============================================================
     //   Консоль
     // ============================================================
-    public const int DesiredColumns = 320;
-    public const int DesiredRows = 100;
+    public const int DesiredColumns = 1280;
+    public const int DesiredRows = 720;
     public const short DesiredFontSize = 8;
     public const short MinimumFontSize = 4;
 
@@ -48,6 +51,19 @@ internal static class GameConfig
     public const int ResizeDelayMs = 200;
     public const int ZoomHintMilliseconds = 4000;
     public const int ZoomHintPollMs = 50;
+
+    /// <summary>
+    ///     Автоматически «отдалять» картинку при старте: уменьшать шрифт в классической консоли
+    ///     и многократно нажимать «Ctrl + −» в Windows Terminal (там размер шрифта консольным
+    ///     API не меняется). Если сделать это не удалось, показывается подсказка.
+    /// </summary>
+    public const bool AutoZoomOut = true;
+
+    /// <summary>Пауза после эмуляции зума, чтобы терминал успел применить новый шрифт.</summary>
+    public const int AutoZoomOutSettleMs = 150;
+
+    /// <summary>Сколько держать экран загрузки, пока настраивается масштаб терминала.</summary>
+    public const int LoadingScreenMs = 650;
 
     // ============================================================
     //   Игрок
@@ -121,4 +137,18 @@ internal static class GameConfig
     public const double BobRisePerSecond = 8.0;
     public const double BobFallPerSecond = 5.0;
     public const double BobTimeWrap = 1000.0;
+
+    // ============================================================
+    //   Мышь
+    // ============================================================
+
+    /// <summary>Поворот мышью: сколько радиан на каждый пиксель горизонтального сдвига.</summary>
+    public const double MouseSensitivity = 0.0025;
+
+    /// <summary>
+    ///     Захватывать курсор во время игры: пока окно терминала на переднем плане, курсор
+    ///     скрывается и удерживается в исходной точке, поэтому поворачиваться можно бесконечно
+    ///     (как обзор мышью в шутере). При потере фокуса курсор снова показывается.
+    /// </summary>
+    public const bool CaptureMouse = true;
 }

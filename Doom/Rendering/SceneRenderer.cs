@@ -125,7 +125,7 @@ internal sealed class SceneRenderer
         for (int sample = 0; sample < raysPerColumn; sample++)
         {
             double t = (x + (sample + 0.5) / raysPerColumn) / viewport.Columns;
-            double rayAngle = player.Angle - GameConfig.HalfFieldOfView + GameConfig.FieldOfView * t;
+            double rayAngle = player.Angle - viewport.HalfFieldOfViewRadians + viewport.FieldOfViewRadians * t;
 
             RayHit hit = Raycaster.Cast(level, player.X, player.Y, rayAngle);
             if (hit.TileType == 0)

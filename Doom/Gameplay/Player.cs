@@ -93,6 +93,70 @@ internal sealed class Player
 
     public void Turn(double deltaRadians) => Angle += deltaRadians;
 
+    // ============================================================
+    //   Читы: оружие и боеприпасы (используются экраном «Читы»)
+    // ============================================================
+
+    /// <summary>Выдаёт оружие.</summary>
+    public void Grant(WeaponKind kind) => _owned[(int)kind] = true;
+
+    /// <summary>Забирает оружие. Кулак отобрать нельзя, а вместо текущего ствола берётся другой.</summary>
+    public void Revoke(WeaponKind kind)
+    {
+        if (kind == WeaponKind.Fist)
+            return;
+
+        _owned[(int)kind] = false;
+
+        if (kind == CurrentWeapon)
+            SelectFallback();
+    }
+
+    /// <summary>Выдаёт или забирает оружие.</summary>
+    public void SetOwned(WeaponKind kind, bool owned)
+    {
+        if (owned)
+            Grant(kind);
+        else
+            Revoke(kind);
+    }
+
+    /// <summary>Задаёт запас боеприпасов, зажимая значение в допустимый диапазон.</summary>
+    public void SetAmmo(AmmoKind kind, int amount)
+    {
+        if (kind == AmmoKind.None)
+            return;
+
+        _ammo[(int)kind] = Math.Clamp(amount, 0, AmmoCatalog.Capacity(kind));
+    }
+
+    /// <summary>«Дать всё»: всё оружие и полный боезапас.</summary>
+    public void GiveAll()
+    {
+        for (int index = 0; index < _owned.Length; index++)
+            _owned[index] = true;
+
+        for (int index = 1; index < _ammo.Length; index++)
+            _ammo[index] = AmmoCatalog.Capacity((AmmoKind)index);
+    }
+
+    /// <summary>Берёт лучший доступный ствол, если текущий отобрали (мгновенно, без подъёма).</summary>
+    private void SelectFallback()
+    {
+        for (int index = WeaponCatalog.Count - 1; index >= 0; index--)
+        {
+            var candidate = (WeaponKind)index;
+            if (!Owns(candidate))
+                continue;
+
+            CurrentWeapon = candidate;
+            LastSwitchTime = double.NegativeInfinity;
+            return;
+        }
+
+        CurrentWeapon = WeaponKind.Fist;
+    }
+
     /// <summary>Берёт оружие, если оно есть у игрока. Возвращает <c>true</c>, если ствол сменился.</summary>
     public bool SelectWeapon(WeaponKind kind, double nowSeconds)
     {

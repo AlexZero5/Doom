@@ -109,7 +109,7 @@ internal static class SpriteProjector
             return;
 
         double relativeAngle = Normalize(Math.Atan2(dy, dx) - player.Angle);
-        if (Math.Abs(relativeAngle) > GameConfig.HalfFieldOfView + AngleMargin)
+        if (Math.Abs(relativeAngle) > viewport.HalfFieldOfViewRadians + AngleMargin)
             return;
 
         double screenX = viewport.Columns * 0.5
@@ -122,7 +122,7 @@ internal static class SpriteProjector
             return;
 
         double halfAngle = Math.Atan2(width * 0.5, distance);
-        double halfColumns = viewport.Columns * halfAngle / GameConfig.FieldOfView;
+        double halfColumns = viewport.Columns * halfAngle / viewport.FieldOfViewRadians;
 
         double topY = viewport.PixelRows * 0.5 + viewport.PixelRows * (CameraZ - topZ) / distance;
         double bottomY = viewport.PixelRows * 0.5 + viewport.PixelRows * (CameraZ - bottomZ) / distance;

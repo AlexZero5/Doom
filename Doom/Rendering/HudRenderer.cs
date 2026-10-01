@@ -36,7 +36,7 @@ internal static class HudRenderer
 
         x = Paint(framebuffer, y, x, "  ", TextColor);
         x = PaintSlots(framebuffer, y, x, player);
-        Paint(framebuffer, y, x, "  [SPACE] fire  [1-7] weapon  [Q/E] cycle  [R] restart  [ESC] quit", DimColor);
+        Paint(framebuffer, y, x, "  [SPACE/LMB] fire  [1-7] weapon  [Q/E] cycle  [R] restart  [ESC] menu", DimColor);
     }
 
     /// <summary>Рисует текст сегмента и возвращает позицию следующего символа.</summary>
