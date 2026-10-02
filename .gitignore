@@ -90,3 +90,6 @@ launchSettings.json
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# Бинарный кэш текстур (генерится игрой из assets/*.png)
+assets/.cache/
