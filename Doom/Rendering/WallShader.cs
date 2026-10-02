@@ -1,10 +1,12 @@
+using Doom.Assets;
 using Doom.Configuration;
 
 namespace Doom.Rendering;
 
 /// <summary>
 ///     Освещение стены: затемнение по расстоянию, тень на горизонтальных гранях
-///     и текстурирование кирпичом.
+///     и текстурирование — из PNG-ассета (assets/walls/&lt;тип&gt;.png), а если его нет,
+///     процедурной кирпичной кладкой.
 /// </summary>
 internal static class WallShader
 {
@@ -16,7 +18,7 @@ internal static class WallShader
 
     /// <summary>Цвет одного «пикселя» стены.</summary>
     public static int Shade(
-        int baseR, int baseG, int baseB,
+        int baseR, int baseG, int baseB, Texture? texture,
         double distance, int side, double wallX,
         int pixelY, double wallTop, double wallHeight)
     {
@@ -39,7 +41,31 @@ internal static class WallShader
             double k = (sample + 0.5) / GameConfig.TextureSamples;
             double sampleY = startY + (endY - startY) * k;
 
-            (double r, double g, double b) = BrickWallTexture.Sample(baseR, baseG, baseB, wallX, sampleY);
+            double r, g, b;
+
+            if (texture is not null)
+            {
+                int argb = texture.Sample(wallX, sampleY);
+
+                // «Дырка» в текстуре стены показывает базовый цвет клетки.
+                if (Texture.IsTransparent(argb))
+                {
+                    r = baseR;
+                    g = baseG;
+                    b = baseB;
+                }
+                else
+                {
+                    r = (argb >>> 16) & 0xFF;
+                    g = (argb >>> 8) & 0xFF;
+                    b = argb & 0xFF;
+                }
+            }
+            else
+            {
+                (r, g, b) = BrickWallTexture.Sample(baseR, baseG, baseB, wallX, sampleY);
+            }
+
             sumR += r;
             sumG += g;
             sumB += b;

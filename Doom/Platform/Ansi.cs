@@ -9,6 +9,10 @@ internal static class Ansi
     public const string HideCursor = "\x1b[?25l";
     public const string ShowCursor = "\x1b[?25h";
 
+    /// <summary>Отчёт о мыши: клики (1000), любое движение (1003) и SGR-кодирование (1006).</summary>
+    public const string EnableMouseReporting = "\x1b[?1000;1003;1006h";
+    public const string DisableMouseReporting = "\x1b[?1000;1003;1006l";
+
     /// <summary>Запрос на изменение размеров окна терминала.</summary>
     public static string Resize(int columns, int rows) => $"\x1b[8;{rows};{columns}t";
 }

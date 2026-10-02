@@ -1,3 +1,4 @@
+using Doom.Assets;
 using Doom.Configuration;
 using Doom.Gameplay;
 
@@ -5,7 +6,9 @@ namespace Doom.Rendering;
 
 /// <summary>
 ///     Отрисовка оружия от первого лица: покачивание при ходьбе, отдача, подъём ствола
-///     после смены и вспышка выстрела. Каждый ствол рисуется своей процедурной графикой.
+///     после смены и вспышка выстрела. Если в assets/weapons/ есть PNG для ствола
+///     (pistol.png, shotgun.png…), рисуется текстура; иначе — процедурная графика.
+///     Вспышка у дула тоже может быть анимацией из assets/anims/muzzle/.
 /// </summary>
 internal static class WeaponRenderer
 {
@@ -13,7 +16,8 @@ internal static class WeaponRenderer
     private const double BobSpeed = 4.5;
     private const double BobAmplitude = 2.0;
 
-    public static void Draw(Framebuffer framebuffer, Viewport viewport, Player player, double nowSeconds)
+    public static void Draw(
+        Framebuffer framebuffer, Viewport viewport, Player player, double nowSeconds, AssetStore? assets = null)
     {
         double scale = Math.Max(1.0, viewport.Rows / ScaleBaseRows);
         WeaponInfo info = WeaponCatalog.Get(player.CurrentWeapon);
@@ -31,6 +35,29 @@ internal static class WeaponRenderer
 
         int centerX = viewport.Columns / 2 + bobX;
         int baseY = bottom + recoil + raise;
+
+        // Текстурный путь: PNG ствола из assets/weapons/<имя>.png.
+        Texture? weaponTexture = assets?.GetWeapon(WeaponFile(player.CurrentWeapon));
+        if (weaponTexture is not null)
+        {
+            int weaponTopPixel = DrawSprite(
+                framebuffer, viewport, weaponTexture, centerX,
+                GameConfig.WeaponTextureHeightFraction, bottomAnchorPixels: (baseY + 1) * 2);
+
+            Texture? flashFrame = assets?.GetAnimation("muzzle")
+                ?.Sample(nowSeconds - player.LastFireTime);
+
+            if (muzzleFlash && flashFrame is not null)
+            {
+                // Вспышка сидит у верха ствола, слегка перекрывая его.
+                DrawSprite(framebuffer, viewport, flashFrame, centerX,
+                    GameConfig.MuzzleAnimationHeightFraction,
+                    bottomAnchorPixels: weaponTopPixel + (int)(viewport.PixelRows
+                        * GameConfig.MuzzleAnimationHeightFraction) / 3);
+            }
+
+            return;
+        }
 
         switch (player.CurrentWeapon)
         {
@@ -59,6 +86,81 @@ internal static class WeaponRenderer
                 DrawBfg(framebuffer, viewport, centerX, baseY, muzzleFlash, fireProgress, scale);
                 break;
         }
+    }
+
+    /// <summary>Имя PNG-файла ствола в assets/weapons/.</summary>
+    private static string WeaponFile(WeaponKind kind) => kind switch
+    {
+        WeaponKind.Fist => "fist",
+        WeaponKind.Chainsaw => "chainsaw",
+        WeaponKind.Pistol => "pistol",
+        WeaponKind.Shotgun => "shotgun",
+        WeaponKind.Chaingun => "chaingun",
+        WeaponKind.RocketLauncher => "rocketlauncher",
+        WeaponKind.PlasmaRifle => "plasmarifle",
+        WeaponKind.Bfg9000 => "bfg9000",
+        _ => "pistol"
+    };
+
+    /// <summary>
+    ///     Рисует текстуру спрайтом: высота задана долей кадра, ширина — по пропорциям,
+    ///     прозрачные пиксели не трогают фон. Возвращает верхний «пиксель» спрайта.
+    /// </summary>
+    private static int DrawSprite(
+        Framebuffer framebuffer, Viewport viewport, Texture texture,
+        int centerCellX, double heightFraction, int bottomAnchorPixels)
+    {
+        int heightPixels = (int)(viewport.PixelRows * heightFraction);
+        if (heightPixels < 2)
+            return bottomAnchorPixels;
+
+        int widthPixels = Math.Max(1, (int)Math.Round((double)heightPixels * texture.Width / texture.Height));
+        int leftPixel = centerCellX * 2 - widthPixels / 2;
+        int topPixel = bottomAnchorPixels - heightPixels;
+
+        int drawTop = Math.Max(0, topPixel);
+        int drawBottom = Math.Min(viewport.PixelRows, bottomAnchorPixels);
+        int drawLeft = Math.Max(0, leftPixel);
+        int drawRight = Math.Min(framebuffer.Columns * 2, leftPixel + widthPixels);
+
+        for (int pixelY = drawTop; pixelY < drawBottom; pixelY++)
+        {
+            int sourceY = (pixelY - topPixel) * texture.Height / heightPixels;
+            sourceY = Math.Clamp(sourceY, 0, texture.Height - 1);
+
+            int cellY = pixelY >> 1;
+            if (cellY >= framebuffer.Rows - 1)
+                break; // последняя строка — строка состояния
+
+            bool isTopHalf = (pixelY & 1) == 0;
+            int rowBase = cellY * framebuffer.Columns;
+
+            for (int pixelX = drawLeft; pixelX < drawRight; pixelX++)
+            {
+                int sourceX = (pixelX - leftPixel) * texture.Width / widthPixels;
+                sourceX = Math.Clamp(sourceX, 0, texture.Width - 1);
+
+                int argb = texture.SamplePixel(sourceX, sourceY);
+                if (Texture.IsTransparent(argb))
+                    continue;
+
+                int cellX = pixelX >> 1;
+                if (cellX >= framebuffer.Columns)
+                    continue;
+
+                int index = rowBase + cellX;
+                int color = Texture.RgbOf(argb);
+
+                if (isTopHalf)
+                    framebuffer.Foreground[index] = color;
+                else
+                    framebuffer.Background[index] = color;
+
+                framebuffer.Chars[index] = Framebuffer.UpperHalfBlock;
+            }
+        }
+
+        return topPixel;
     }
 
     /// <summary>Отдача: ствол на мгновение уходит вниз, затем возвращается на место.</summary>

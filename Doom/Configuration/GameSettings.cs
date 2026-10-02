@@ -64,6 +64,15 @@ internal sealed class GameSettings
     /// <summary>Захватывать курсор во время игры.</summary>
     public bool CaptureMouse { get; set; } = GameConfig.CaptureMouse;
 
+    /// <summary>Покачивание оружия при ходьбе.</summary>
+    public bool WeaponBob { get; set; } = true;
+
+    /// <summary>Показывать счётчик FPS в строке состояния.</summary>
+    public bool ShowFps { get; set; }
+
+    /// <summary>Автоматически «отдалять» картинку при старте (уменьшать шрифт терминала).</summary>
+    public bool AutoZoom { get; set; } = GameConfig.AutoZoomOut;
+
     /// <summary>Сколько раз нажать «Ctrl + −» при старте: чем выше качество, тем мельче «пиксели».</summary>
     [JsonIgnore]
     public int ZoomOutSteps => Quality switch

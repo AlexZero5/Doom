@@ -122,8 +122,14 @@ internal static class NativeMethods
     public const int VirtualKeyLButton = 0x01;
     public const int VirtualKeyRButton = 0x02;
 
+    // Режимы консольного ввода (SetConsoleMode).
+    public const uint EnableProcessedInput = 0x0001;
+    public const uint EnableLineInput = 0x0002;
+    public const uint EnableEchoInput = 0x0004;
+    public const uint EnableWindowInput = 0x0008;
     public const uint EnableQuickEditMode = 0x0040;
     public const uint EnableExtendedFlags = 0x0080;
+    public const uint EnableVirtualTerminalInput = 0x0200;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct Point
@@ -152,4 +158,79 @@ internal static class NativeMethods
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool SetConsoleMode(IntPtr consoleHandle, uint mode);
+
+    // ============================================================
+    //   События консоли (неблокирующий ввод: клавиши и мышь)
+    // ============================================================
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetNumberOfConsoleInputEvents(IntPtr consoleInput, out uint numberOfEvents);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadConsoleInput(
+        IntPtr consoleInput, [Out] InputRecord[] records, uint length, out uint eventsRead);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetConsoleScreenBufferInfo(
+        IntPtr consoleOutput, out ConsoleScreenBufferInfo consoleScreenBufferInfo);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KeyEventRecord
+    {
+        public int KeyDown;              // BOOL
+        public ushort RepeatCount;
+        public ushort VirtualKeyCode;
+        public ushort VirtualScanCode;
+        public ushort UnicodeChar;
+        public uint ControlKeyState;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MouseEventRecord
+    {
+        public short PositionX;
+        public short PositionY;
+        public uint ButtonState;
+        public uint ControlKeyState;
+        public uint EventFlags;
+    }
+
+    /// <summary>Запись очереди ввода консоли: объединение ключевого и мышиного событий.</summary>
+    [StructLayout(LayoutKind.Explicit)]
+    public struct InputRecord
+    {
+        public const ushort KeyEventFlag = 0x0001;
+        public const ushort MouseEventFlag = 0x0002;
+
+        [FieldOffset(0)] public ushort EventType;
+        [FieldOffset(4)] public KeyEventRecord KeyEvent;
+        [FieldOffset(4)] public MouseEventRecord MouseEvent;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SmallRect
+    {
+        public short Left;
+        public short Top;
+        public short Right;
+        public short Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ConsoleScreenBufferInfo
+    {
+        public Coord BufferSize;
+        public Coord CursorPosition;
+        public ushort Attributes;
+        public SmallRect Window;
+        public Coord MaximumWindowSize;
+    }
+
+    /// <summary>Флаги dwButtonState мыши.</summary>
+    public const uint FromLeft1stButtonPressed = 0x0001;
+    public const uint RightmostButtonPressed = 0x0002;
+
+    /// <summary>Флаги dwEventFlags мыши.</summary>
+    public const uint MouseMovedFlag = 0x0001;
+    public const uint MouseWheeledFlag = 0x0004;
 }

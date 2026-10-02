@@ -65,6 +65,16 @@ internal sealed class Terminal
 
     public void HideCursorAndClearScreen() => Write(Ansi.HideCursor + Ansi.ClearScreen + Ansi.Home);
 
+    /// <summary>
+    ///     Включает отчёт о мыши: терминал присылает клики, движение и колесо в координатах
+    ///     ячеек (SGR-режим). Нужен только в меню — во время игры обзор мышью работает
+    ///     напрямую через <c>GetCursorPos</c>.
+    /// </summary>
+    public void EnableMouseReporting() => Write(Ansi.EnableMouseReporting);
+
+    /// <summary>Выключает отчёт о мыши (обратно в нормальный режим терминала).</summary>
+    public void DisableMouseReporting() => Write(Ansi.DisableMouseReporting);
+
     /// <summary>Возвращает терминал в нормальное состояние.</summary>
     public void Restore()
     {
@@ -80,10 +90,12 @@ internal sealed class Terminal
     }
 
     /// <summary>
-    ///     Отключает режим QuickEdit: иначе клик мышью в классической консоли выделяет текст и
-    ///     останавливает игру до нажатия клавиши, из-за чего стрелять мышью было бы нельзя.
+    ///     Настраивает ввод консоли для игры: отключает QuickEdit (иначе клик мышью в
+    ///     классической консоли выделяет текст и останавливает игру), а также построчный
+    ///     ввод и эхо. Клавиши и мышь игра читает событиями через ReadConsoleInput
+    ///     (см. <see cref="Input.ConsoleInputSource" />).
     /// </summary>
-    public void DisableQuickEdit()
+    public void ConfigureInput()
     {
         if (!OperatingSystem.IsWindows())
             return;
@@ -100,7 +112,12 @@ internal sealed class Terminal
             _originalInputMode = mode;
             _inputModeSaved = true;
 
-            uint updated = (mode & ~NativeMethods.EnableQuickEditMode) | NativeMethods.EnableExtendedFlags;
+            uint updated = mode
+                & ~(NativeMethods.EnableQuickEditMode
+                    | NativeMethods.EnableLineInput
+                    | NativeMethods.EnableEchoInput)
+                | NativeMethods.EnableExtendedFlags;
+
             NativeMethods.SetConsoleMode(handle, updated);
         }
         catch
@@ -110,7 +127,7 @@ internal sealed class Terminal
     }
 
     /// <summary>Возвращает прежний режим ввода консоли (включая QuickEdit).</summary>
-    public void RestoreQuickEdit()
+    public void RestoreInputMode()
     {
         if (!OperatingSystem.IsWindows() || !_inputModeSaved)
             return;
@@ -283,7 +300,7 @@ internal sealed class Terminal
     ///     Подсказывает, как уменьшить «пиксели». Текст печатается через <see cref="Console" />,
     ///     потому что нужна кириллица (кодировка уже переключена на UTF-8).
     /// </summary>
-    public void ShowZoomHint()
+    public void ShowZoomHint(Func<bool>? anyKeyPressed = null)
     {
         Write(Ansi.ClearScreen + Ansi.Home);
 
@@ -297,11 +314,23 @@ internal sealed class Terminal
         long start = Environment.TickCount64;
         while (Environment.TickCount64 - start < GameConfig.ZoomHintMilliseconds)
         {
-            if (Console.KeyAvailable)
+            bool pressed;
+            if (anyKeyPressed is not null)
+            {
+                pressed = anyKeyPressed();
+            }
+            else if (Console.KeyAvailable)
             {
                 Console.ReadKey(true);
-                break;
+                pressed = true;
             }
+            else
+            {
+                pressed = false;
+            }
+
+            if (pressed)
+                break;
 
             Thread.Sleep(GameConfig.ZoomHintPollMs);
         }

@@ -139,6 +139,25 @@ internal static class GameConfig
     public const double BobTimeWrap = 1000.0;
 
     // ============================================================
+    //   Ассеты (assets/ рядом с репозиторием)
+    // ============================================================
+
+    /// <summary>Имя папки с текстурами: walls/, weapons/, sprites/, anims/.</summary>
+    public const string AssetsFolderName = "assets";
+
+    /// <summary>Подпапка бинарного кэша декодированных текстур.</summary>
+    public const string AssetCacheFolderName = ".cache";
+
+    /// <summary>Длительность кадра анимации, если в manifest.json не задано иное.</summary>
+    public const double DefaultAnimationFrameTime = 0.12;
+
+    /// <summary>Высота текстурного оружия как доля высоты кадра (в «пикселях»).</summary>
+    public const double WeaponTextureHeightFraction = 0.45;
+
+    /// <summary>Высота анимации вспышки у дула как доля высоты кадра.</summary>
+    public const double MuzzleAnimationHeightFraction = 0.16;
+
+    // ============================================================
     //   Мышь
     // ============================================================
 

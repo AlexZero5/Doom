@@ -1,3 +1,4 @@
+using Doom.Assets;
 using Doom.Configuration;
 using Doom.Gameplay;
 using Doom.World;
@@ -12,6 +13,14 @@ internal sealed class SceneRenderer
 
     private readonly List<SpriteQuad> _visibleSprites = new();
     private SpriteQuad[] _spriteCache = Array.Empty<SpriteQuad>();
+
+    public SceneRenderer(AssetStore? assets = null)
+    {
+        Assets = assets;
+    }
+
+    /// <summary>Хранилище текстур (может отсутствовать — тогда всё рисуется процедурно).</summary>
+    public AssetStore? Assets { get; }
 
     /// <summary>Рисует кадр: фон, стены, спрайты, засветку от выстрелов и взрывов, оружие и строку состояния.</summary>
     public void Render(
@@ -30,7 +39,7 @@ internal sealed class SceneRenderer
         _visibleSprites.Clear();
         SpriteProjector.ProjectPickups(viewport, player, pickups, _visibleSprites);
         SpriteProjector.ProjectDynamics(viewport, player, projectiles.Projectiles, projectiles.Impacts,
-            _visibleSprites);
+            _visibleSprites, Assets);
         _visibleSprites.Sort(SpriteQuad.CompareByDistance);
 
         if (_spriteCache.Length < _visibleSprites.Count)
@@ -53,7 +62,7 @@ internal sealed class SceneRenderer
         }
 
         ApplyFlash(framebuffer, flashIntensity, flashColor);
-        WeaponRenderer.Draw(framebuffer, viewport, player, nowSeconds);
+        WeaponRenderer.Draw(framebuffer, viewport, player, nowSeconds, Assets);
         HudRenderer.Draw(framebuffer, player);
     }
 
@@ -151,6 +160,7 @@ internal sealed class SceneRenderer
             wallDistance = distance;
 
             (int baseR, int baseG, int baseB) = WallPalette.GetBaseColor(hitTileType);
+            Texture? wallTexture = Assets?.GetWall(hitTileType);
 
             double wallHeight = viewport.PixelRows / distance;
             double wallTop = viewport.PixelRows / 2.0 - wallHeight / 2.0;
@@ -172,7 +182,8 @@ internal sealed class SceneRenderer
                 if (topCoverage > 0)
                 {
                     int color = WallShader.Shade(
-                        baseR, baseG, baseB, distance, side, wallTextureX, topPixel, wallTop, wallHeight);
+                        baseR, baseG, baseB, wallTexture, distance, side, wallTextureX,
+                        topPixel, wallTop, wallHeight);
 
                     foreground[index] = topCoverage >= 1
                         ? color
@@ -182,7 +193,8 @@ internal sealed class SceneRenderer
                 if (bottomCoverage > 0)
                 {
                     int color = WallShader.Shade(
-                        baseR, baseG, baseB, distance, side, wallTextureX, bottomPixel, wallTop, wallHeight);
+                        baseR, baseG, baseB, wallTexture, distance, side, wallTextureX,
+                        bottomPixel, wallTop, wallHeight);
 
                     background[index] = bottomCoverage >= 1
                         ? color
@@ -203,6 +215,12 @@ internal sealed class SceneRenderer
 
             if (x + 0.5 < sprite.MinX || x + 0.5 > sprite.MaxX)
                 continue;
+
+            if (sprite.Texture is not null)
+            {
+                RenderTexturedSpriteColumn(x, framebuffer, viewport, sprite);
+                continue;
+            }
 
             for (int y = 0; y < viewport.Rows; y++)
             {
@@ -234,6 +252,83 @@ internal sealed class SceneRenderer
                 }
             }
         }
+    }
+
+    /// <summary>Колонка текстурированного спрайта: сэмплы по UV с затенением и альфой.</summary>
+    private void RenderTexturedSpriteColumn(
+        int x,
+        Framebuffer framebuffer,
+        Viewport viewport,
+        SpriteQuad sprite)
+    {
+        Texture texture = sprite.Texture!;
+        double quadWidth = sprite.MaxX - sprite.MinX;
+        double quadHeight = sprite.BottomY - sprite.TopY;
+
+        if (quadWidth <= 0.001 || quadHeight <= 0.001)
+            return;
+
+        double u = (x + 0.5 - sprite.MinX) / quadWidth;
+        int texX = Math.Clamp((int)(u * texture.Width), 0, texture.Width - 1);
+
+        char[] chars = framebuffer.Chars;
+        int[] foreground = framebuffer.Foreground;
+        int[] background = framebuffer.Background;
+
+        for (int y = 0; y < viewport.Rows; y++)
+        {
+            int topPixel = y * 2;
+            int bottomPixel = y * 2 + 1;
+
+            double topCoverage = PixelCoverage(topPixel, sprite.TopY, sprite.BottomY);
+            double bottomCoverage = PixelCoverage(bottomPixel, sprite.TopY, sprite.BottomY);
+            if (topCoverage <= 0 && bottomCoverage <= 0)
+                continue;
+
+            int index = y * viewport.Columns + x;
+            chars[index] = Framebuffer.UpperHalfBlock;
+
+            if (topCoverage > 0)
+            {
+                int argb = SampleSprite(texture, texX, topPixel, sprite.TopY, quadHeight);
+                if (!Texture.IsTransparent(argb))
+                {
+                    double alpha = topCoverage * sprite.Alpha * ((argb >>> 24) / 255.0);
+                    int color = ShadeSpritePixel(argb, sprite.Brightness);
+                    foreground[index] = alpha >= 1
+                        ? color
+                        : ColorRgb.Blend(foreground[index], color, alpha);
+                }
+            }
+
+            if (bottomCoverage > 0)
+            {
+                int argb = SampleSprite(texture, texX, bottomPixel, sprite.TopY, quadHeight);
+                if (!Texture.IsTransparent(argb))
+                {
+                    double alpha = bottomCoverage * sprite.Alpha * ((argb >>> 24) / 255.0);
+                    int color = ShadeSpritePixel(argb, sprite.Brightness);
+                    background[index] = alpha >= 1
+                        ? color
+                        : ColorRgb.Blend(background[index], color, alpha);
+                }
+            }
+        }
+    }
+
+    private static int SampleSprite(Texture texture, int texX, int pixelY, double quadTop, double quadHeight)
+    {
+        double v = (pixelY + 0.5 - quadTop) / quadHeight;
+        int texY = Math.Clamp((int)(v * texture.Height), 0, texture.Height - 1);
+        return texture.SamplePixel(texX, texY);
+    }
+
+    private static int ShadeSpritePixel(int argb, double brightness)
+    {
+        int r = Math.Clamp((int)(((argb >>> 16) & 0xFF) * brightness), 0, 255);
+        int g = Math.Clamp((int)(((argb >>> 8) & 0xFF) * brightness), 0, 255);
+        int b = Math.Clamp((int)((argb & 0xFF) * brightness), 0, 255);
+        return ColorRgb.Pack(r, g, b);
     }
 
     /// <summary>Доля «пикселя», попавшая в вертикальный отрезок (сглаживание краёв).</summary>

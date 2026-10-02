@@ -1,3 +1,4 @@
+using Doom.Assets;
 using Doom.Configuration;
 using Doom.Gameplay;
 using Doom.World;
@@ -57,17 +58,22 @@ internal static class SpriteProjector
         Player player,
         IReadOnlyList<Projectile> projectiles,
         IReadOnlyList<Impact> impacts,
-        List<SpriteQuad> output)
+        List<SpriteQuad> output,
+        AssetStore? assets = null)
     {
+        AnimationClip? explosion = assets?.GetAnimation("explosion");
+
         foreach (Projectile projectile in projectiles)
         {
             if (!projectile.Alive)
                 continue;
 
             ProjectileVisual visual = ProjectilePalette.Get(projectile.Kind);
+            string? spriteName = ProjectileSpriteName(projectile.Kind);
 
             AddQuad(viewport, player, projectile.X, projectile.Y, visual.BottomZ, visual.TopZ, visual.Width,
-                visual.Color, alpha: 1.0, output);
+                visual.Color, alpha: 1.0, output,
+                texture: spriteName is null ? null : assets?.GetSprite(spriteName));
         }
 
         foreach (Impact impact in impacts)
@@ -85,9 +91,27 @@ internal static class SpriteProjector
             double rise = visual.Rise * impact.Age;
 
             AddQuad(viewport, player, impact.X, impact.Y, visual.BottomZ + rise, visual.TopZ + rise, width,
-                visual.Color, alpha, output);
+                visual.Color, alpha, output,
+                texture: explosion?.SampleProgress(progress) is { } frame && IsExplosion(impact.Kind)
+                    ? frame
+                    : null);
         }
     }
+
+    /// <summary>Имя PNG-спрайта снаряда в assets/sprites/ (null — процедурный цвет).</summary>
+    private static string? ProjectileSpriteName(ProjectileKind kind) => kind switch
+    {
+        ProjectileKind.Rocket => "rocket",
+        ProjectileKind.PlasmaBolt => "plasma",
+        ProjectileKind.BfgBall => "bfg",
+        _ => null
+    };
+
+    /// <summary>Крупные эффекты рисуются кадрами anims/explosion; искры и дымки — цветом.</summary>
+    private static bool IsExplosion(ImpactKind kind) => kind is ImpactKind.RocketExplosion
+        or ImpactKind.PlasmaImpact
+        or ImpactKind.BfgImpact
+        or ImpactKind.ExplosionPuff;
 
     /// <summary>Проекция одного билборда: экранная позиция, высота и глубина.</summary>
     private static void AddQuad(
@@ -100,7 +124,8 @@ internal static class SpriteProjector
         double width,
         int baseColor,
         double alpha,
-        List<SpriteQuad> output)
+        List<SpriteQuad> output,
+        Texture? texture = null)
     {
         double dx = x - player.X;
         double dy = y - player.Y;
@@ -136,7 +161,9 @@ internal static class SpriteProjector
             bottomY: bottomY,
             perpendicularDistance: perpendicularDistance,
             color: Shade(baseColor, perpendicularDistance),
-            alpha: alpha));
+            alpha: alpha,
+            texture: texture,
+            brightness: BrightnessAt(perpendicularDistance)));
     }
 
     private static double Normalize(double angle)
@@ -150,12 +177,17 @@ internal static class SpriteProjector
         return angle;
     }
 
-    private static int Shade(int baseColor, double distance)
+    private static double BrightnessAt(double distance)
     {
         double brightness = LightRange / (distance + LightOffset);
         if (brightness > 1) brightness = 1;
         if (brightness < MinBrightness) brightness = MinBrightness;
-        brightness = Math.Pow(brightness, Gamma);
+        return Math.Pow(brightness, Gamma);
+    }
+
+    private static int Shade(int baseColor, double distance)
+    {
+        double brightness = BrightnessAt(distance);
 
         return ColorRgb.Pack(
             (int)(ColorRgb.Red(baseColor) * brightness),

@@ -39,6 +39,23 @@ internal static class HudRenderer
         Paint(framebuffer, y, x, "  [SPACE/LMB] fire  [1-7] weapon  [Q/E] cycle  [R] restart  [ESC] menu", DimColor);
     }
 
+    /// <summary>Счётчик FPS в правом углу строки состояния (если включён в настройках).</summary>
+    public static void DrawFps(Framebuffer framebuffer, int fps)
+    {
+        string text = $"{Math.Clamp(fps, 0, 999)} FPS";
+        int x = framebuffer.Columns - text.Length - 2;
+        int y = framebuffer.Rows - 1;
+
+        if (x < 0 || y < 0)
+            return;
+
+        for (int index = 0; index < text.Length; index++, x++)
+        {
+            if (x >= 0 && x < framebuffer.Columns)
+                framebuffer.Set(x, y, text[index], DimColor, TextBackground);
+        }
+    }
+
     /// <summary>Рисует текст сегмента и возвращает позицию следующего символа.</summary>
     private static int Paint(Framebuffer framebuffer, int y, int x, string text, int color)
     {

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Doom.Assets;
 using Doom.Configuration;
 using Doom.Gameplay;
 using Doom.Input;
@@ -17,15 +18,18 @@ internal sealed class DoomGame
     private readonly Terminal _terminal = new();
     private readonly KeyboardState _keyboard = new();
     private readonly MouseState _mouse = new();
+    private readonly ConsoleInputSource _input = new();
     private readonly MenuController _menu = new();
     private readonly Level _level = Level.CreateDefault();
     private readonly Player _player = new();
     private readonly List<Pickup> _pickups = new();
-    private readonly SceneRenderer _renderer = new();
     private readonly ProjectileSystem _projectiles = new();
     private readonly ConsolePresenter _presenter;
     private readonly Stopwatch _totalTimer = new();
     private readonly Stopwatch _frameTimer = new();
+
+    private readonly AssetStore _assets;
+    private readonly SceneRenderer _renderer;
 
     private Framebuffer _framebuffer = new(1, 1);
     private Viewport _viewport;
@@ -40,8 +44,16 @@ internal sealed class DoomGame
     /// <summary>Счётчик выстрелов: по нему считается детерминированный разброс дробинок.</summary>
     private int _shotCounter;
 
+    /// <summary>Меню ждёт перерисовки (открытие, движение мыши, изменение настроек).</summary>
+    private bool _menuDirty;
+
+    /// <summary>Сглаженное значение FPS для счётчика в строке состояния.</summary>
+    private double _fps;
+
     public DoomGame()
     {
+        _assets = new AssetStore();
+        _renderer = new SceneRenderer(_assets);
         _presenter = new ConsolePresenter(_terminal);
         _pickups.AddRange(PickupLayout.CreateDefault());
     }
@@ -49,14 +61,15 @@ internal sealed class DoomGame
     public void Run()
     {
         GameSettings.Load();
+        _assets.Load();
 
         if (!PrepareTerminal())
             return;
 
         _terminal.HideCursorAndClearScreen();
 
-        // Клик мышью не должен включать выделение текста и останавливать игру (QuickEdit в conhost).
-        _terminal.DisableQuickEdit();
+        // Ввод в сыром режиме: без QuickEdit и построчного редактирования, с VT-мышью в меню.
+        _terminal.ConfigureInput();
 
         // Левой кнопкой стреляем, движением — обзор; при захвате курсор удерживается на месте.
         if (GameSettings.Current.CaptureMouse)
@@ -75,8 +88,10 @@ internal sealed class DoomGame
         finally
         {
             GameSettings.Current.Save();
+            _assets.Dispose();
             _mouse.EndCapture();
-            _terminal.RestoreQuickEdit();
+            _terminal.DisableMouseReporting();
+            _terminal.RestoreInputMode();
             _terminal.Restore();
         }
     }
@@ -91,7 +106,7 @@ internal sealed class DoomGame
         _terminal.ShowLoadingScreen();
         Thread.Sleep(GameConfig.LoadingScreenMs);
 
-        bool zoomedOut = GameConfig.AutoZoomOut && _terminal.TryAutoZoomOut();
+        bool zoomedOut = GameConfig.AutoZoomOut && GameSettings.Current.AutoZoom && _terminal.TryAutoZoomOut();
         if (!zoomedOut)
             _terminal.TrySetFontSize(GameConfig.DesiredFontSize);
 
@@ -111,7 +126,7 @@ internal sealed class DoomGame
 
         // Подсказку показываем только если «отдалить» автоматически не получилось.
         if (!zoomedOut)
-            _terminal.ShowZoomHint();
+            _terminal.ShowZoomHint(PollAnyKey);
 
         // После подсказки и ресайза окно могло измениться — читаем размер ещё раз.
         Terminal.ReadWindowSize(out columns, out rows);
@@ -150,8 +165,52 @@ internal sealed class DoomGame
     {
         args.Cancel = false;
         _mouse.EndCapture();
-        _terminal.RestoreQuickEdit();
+        _terminal.DisableMouseReporting();
+        _terminal.RestoreInputMode();
         _terminal.Restore();
+    }
+
+    /// <summary>Читает одно нажатие клавиши: из событий консоли или напрямую (не-Windows).</summary>
+    private bool TryReadKey(out ConsoleKey key)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            if (_input.TryReadKey(out VtKeyEvent vtKey))
+            {
+                key = vtKey.Key;
+                return true;
+            }
+
+            key = 0;
+            return false;
+        }
+
+        if (Console.KeyAvailable)
+        {
+            key = Console.ReadKey(true).Key;
+            return true;
+        }
+
+        key = 0;
+        return false;
+    }
+
+    /// <summary>Опрос «нажата ли какая-нибудь клавиша» для экрана подсказки.</summary>
+    private bool PollAnyKey()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            _input.Poll();
+            return _input.TryReadKey(out _);
+        }
+
+        if (Console.KeyAvailable)
+        {
+            Console.ReadKey(true);
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>Обрабатывает нажатия клавиш во время игры.</summary>
@@ -159,10 +218,8 @@ internal sealed class DoomGame
     {
         double nowSeconds = nowMs / 1000.0;
 
-        while (Console.KeyAvailable)
+        while (TryReadKey(out ConsoleKey key))
         {
-            ConsoleKey key = Console.ReadKey(true).Key;
-
             switch (key)
             {
                 case ConsoleKey.Escape:
@@ -253,6 +310,12 @@ internal sealed class DoomGame
 
             _mouse.Update();
 
+            // Забираем клавиши и мышь из очереди событий консоли (клавиатура меню,
+            // мышь меню, Esc во время игры — всё приходит отсюда) и применяем
+            // изменения ассетов: перекрашенный в редакторе PNG подхватывается на лету.
+            _input.Poll();
+            _assets.Poll();
+
             if (_screen == GameScreen.Playing)
                 HandleGameKeys(nowMs);
 
@@ -290,7 +353,10 @@ internal sealed class DoomGame
             }
             else
             {
-                redraw = !hasRendered || HandleMenuKeys();
+                // Меню перерисовывается по событиям: открытие, клавиши, движение мыши.
+                bool menuChanged = ProcessMenuInput();
+                redraw = !hasRendered || menuChanged || _menuDirty;
+                _menuDirty = false;
             }
 
             if (redraw)
@@ -298,6 +364,13 @@ internal sealed class DoomGame
                 RenderFrame(nowSeconds);
                 _presenter.Present(_framebuffer);
                 hasRendered = true;
+            }
+
+            double frameSeconds = _frameTimer.Elapsed.TotalSeconds;
+            if (frameSeconds > 0.0001)
+            {
+                double instantFps = 1.0 / frameSeconds;
+                _fps = _fps <= 0 ? instantFps : _fps * 0.9 + instantFps * 0.1;
             }
 
             SleepToTargetFrameRate();
@@ -318,8 +391,11 @@ internal sealed class DoomGame
             _projectiles.FlashIntensity,
             _projectiles.FlashColor);
 
+        if (GameSettings.Current.ShowFps)
+            HudRenderer.DrawFps(_framebuffer, (int)Math.Round(_fps));
+
         if (_screen != GameScreen.Playing)
-            MenuRenderer.Draw(_framebuffer, _menu, _player);
+            MenuRenderer.Draw(_framebuffer, _menu, _player, _assets);
     }
 
     /// <summary>Открывает меню-паузу и освобождает курсор, чтобы мышью можно было выбирать пункты.</summary>
@@ -328,34 +404,52 @@ internal sealed class DoomGame
         _menu.Open();
         _screen = GameScreen.MainMenu;
         _mouse.EndCapture();
+        _input.Clear();
+
+        // Терминал начинает присылать события мыши: наведение, клики, колесо.
+        _terminal.EnableMouseReporting();
+
+        // Иначе меню появится только после следующего события (баг «Esc не сразу»).
+        _menuDirty = true;
     }
 
-    /// <summary>Обрабатывает нажатия в меню. Возвращает <c>true</c>, если нужна перерисовка.</summary>
-    private bool HandleMenuKeys()
+    /// <summary>Обрабатывает клавиши и мышь в меню. Возвращает <c>true</c>, если нужна перерисовка.</summary>
+    private bool ProcessMenuInput()
     {
         bool redraw = false;
 
-        while (Console.KeyAvailable)
+        while (TryReadKey(out ConsoleKey key))
         {
-            ConsoleKey key = Console.ReadKey(true).Key;
+            ApplyMenuCommand(_menu.HandleKey(key, _player), ref redraw);
+        }
 
-            switch (_menu.HandleKey(key, _player))
+        if (OperatingSystem.IsWindows())
+        {
+            while (_input.TryReadMouse(out VtMouseEvent mouse))
             {
-                case MenuCommand.Redraw:
-                    redraw = true;
-                    break;
-                case MenuCommand.Resume:
-                    ResumeGame();
-                    redraw = true;
-                    break;
-                case MenuCommand.Quit:
-                    _quitRequested = true;
-                    redraw = true;
-                    break;
+                ApplyMenuCommand(_menu.HandleMouse(mouse, _player), ref redraw);
             }
         }
 
         return redraw;
+    }
+
+    private void ApplyMenuCommand(MenuCommand command, ref bool redraw)
+    {
+        switch (command)
+        {
+            case MenuCommand.Redraw:
+                redraw = true;
+                break;
+            case MenuCommand.Resume:
+                ResumeGame();
+                redraw = true;
+                break;
+            case MenuCommand.Quit:
+                _quitRequested = true;
+                redraw = true;
+                break;
+        }
     }
 
     /// <summary>Возвращает управление игре и применяет новые настройки (например, угол обзора).</summary>
@@ -366,6 +460,10 @@ internal sealed class DoomGame
         _previousFrameTime = _totalTimer.Elapsed.TotalSeconds;
 
         GameSettings.Current.Save();
+
+        // Мышь снова для обзора: отчёт о событиях больше не нужен.
+        _terminal.DisableMouseReporting();
+        _input.Clear();
 
         if (GameSettings.Current.CaptureMouse)
             _mouse.BeginCapture();
@@ -442,7 +540,12 @@ internal sealed class DoomGame
             anyInput = true;
 
         _projectiles.Update(deltaSeconds, _level);
-        _player.UpdateWeaponBob(deltaSeconds, isMoving);
+
+        // Покачивание оружия можно отключить в настройках: амплитуда плавно гаснет.
+        if (GameSettings.Current.WeaponBob)
+            _player.UpdateWeaponBob(deltaSeconds, isMoving);
+        else if (_player.BobIntensity > 0.0001)
+            _player.UpdateWeaponBob(deltaSeconds, false);
 
         return anyInput;
     }
