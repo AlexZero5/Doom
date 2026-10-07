@@ -41,6 +41,9 @@ internal static class MenuRenderer
     private const int DetailedStep = BarHeight + 8 + ItemGap;
     private const int TrackWidth = 56;
 
+    /// <summary>Отступ над закреплённой кнопкой «Применить» и её высота.</summary>
+    private const int ApplyButtonGap = 3;
+
     /// <summary>Отрисовывает меню поверх уже готового кадра и сохраняет раскладку для мыши.</summary>
     public static void Draw(Framebuffer framebuffer, MenuController menu, Player player, AssetStore? assets = null)
     {
@@ -56,8 +59,13 @@ internal static class MenuRenderer
         bool detailed = menu.Detailed;
         int step = detailed ? DetailedStep : SimpleStep;
 
+        // На экране настроек внизу панели закреплена кнопка «Применить» —
+        // всегда видна, скроллится только список пунктов.
+        bool showApplyButton = menu.Screen == GameScreen.Settings;
+        int buttonZone = showApplyButton ? ApplyButtonGap + BarHeight : 0;
+
         int contentWidth = MeasureContent(entries, detailed);
-        int panelWidth = contentWidth + Padding * 2;
+        int panelWidth = Math.Max(contentWidth + Padding * 2, PixelFont.Measure("ПРИМЕНИТЬ") + 24);
 
         // Масштаб: самый крупный, при котором панель влезает и не съедает весь экран.
         int scale = 1;
@@ -66,8 +74,9 @@ internal static class MenuRenderer
         foreach (int candidate in new[] { 4, 3, 2 })
         {
             int visible = Math.Min(entries.Count,
-                Math.Max(1, (canvas.Height / candidate - (TitleHeight + TitleGap + Padding)) / step));
-            int candidateHeight = TitleHeight + TitleGap + visible * step + Padding;
+                Math.Max(1, (canvas.Height / candidate
+                             - (TitleHeight + TitleGap + Padding + buttonZone)) / step));
+            int candidateHeight = TitleHeight + TitleGap + visible * step + Padding + buttonZone;
 
             if (panelWidth * candidate <= canvas.Width
                 && candidateHeight * candidate <= canvas.Height
@@ -83,7 +92,7 @@ internal static class MenuRenderer
         maxVisible = Math.Min(maxVisible, entries.Count);
         menu.MaxVisible = maxVisible;
 
-        int panelHeight = TitleHeight + TitleGap + maxVisible * step + Padding;
+        int panelHeight = TitleHeight + TitleGap + maxVisible * step + Padding + buttonZone;
         int panelLeft = Math.Max(0, (canvas.Width / scale - panelWidth) / 2);
         int panelTop = Math.Max(1, (canvas.Height / scale - panelHeight) / 2);
 
@@ -160,6 +169,26 @@ internal static class MenuRenderer
                         normalFill, hoverFill, withPointer: true);
                     break;
             }
+        }
+
+        // Закреплённая кнопка «Применить»: всегда видна внизу панели настроек,
+        // независимо от прокрутки списка. Индекс — сразу за последним пунктом.
+        if (showApplyButton)
+        {
+            int buttonBarTop = panelTop + panelHeight - Padding - BarHeight;
+
+            var buttonGeometry = new MenuLayout.MenuItemGeom
+            {
+                EntryIndex = entries.Count,
+                Id = MenuEntryId.Apply,
+                BarTop = buttonBarTop,
+                BarBottom = buttonBarTop + BarHeight,
+                ContentLeft = contentLeft,
+                ContentRight = contentRight
+            };
+
+            layout.Items.Add(buttonGeometry);
+            DrawApplyButton(canvas, buttonGeometry, menu.HoverIndex == entries.Count, scale);
         }
 
         DrawScrollIndicators(canvas, panelLeft, panelWidth, contentTop, first, maxVisible,
@@ -310,6 +339,31 @@ internal static class MenuRenderer
                 canvas.TextFilled(textX, textY, text, normalFill, TitleColor, s);
             else
                 canvas.Text(textX, textY, text, TitleColor, s);
+        }
+    }
+
+    /// <summary>Закреплённая кнопка «Применить»: рамка золотом, под курсором — заливка.</summary>
+    private static void DrawApplyButton(PixelCanvas canvas, MenuLayout.MenuItemGeom geometry,
+        bool hovered, int scale)
+    {
+        int s = scale;
+        const string text = "ПРИМЕНИТЬ";
+        int buttonWidth = PixelFont.Measure(text) + 12;
+        int contentWidth = geometry.ContentRight - geometry.ContentLeft;
+        int x = geometry.ContentLeft + Math.Max(0, (contentWidth - buttonWidth) / 2);
+        int y = geometry.BarTop;
+        int textX = (x + 6) * s;
+        int textY = (y + 1) * s;
+
+        if (hovered)
+        {
+            canvas.Rect(x * s, y * s, buttonWidth * s, BarHeight * s, SelectedBackground);
+            canvas.Text(textX, textY, text, SelectedForeground, s);
+        }
+        else
+        {
+            canvas.FrameRect(x * s, y * s, buttonWidth * s, BarHeight * s, TitleColor);
+            canvas.Text(textX, textY, text, TitleColor, s);
         }
     }
 

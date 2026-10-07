@@ -23,7 +23,12 @@ internal static class WeaponRenderer
         WeaponInfo info = WeaponCatalog.Get(player.CurrentWeapon);
 
         // Оружие прижато к низу: по вертикали анимируются отдача и подъём после смены.
+        // Наклон взгляда утапливает ствол вниз (взгляд вверх) или поднимает (взгляд вниз),
+        // но не сильнее трети экрана, чтобы ствол не уезжал за кадр на предельном наклоне.
         int bottom = viewport.Rows - 2;
+        double pitchShift = viewport.HorizonPixels(player.Pitch) - viewport.PixelRows * 0.5;
+        double pitchOffsetClamped = Math.Clamp(pitchShift * 0.2, -viewport.Rows * 0.35, viewport.Rows * 0.35);
+        int pitchOffset = (int)Math.Round(pitchOffsetClamped);
         int bobX = (int)Math.Round(
             Math.Sin(player.WeaponBobTime * BobSpeed) * BobAmplitude * scale * player.BobIntensity);
 
@@ -34,7 +39,7 @@ internal static class WeaponRenderer
         double thrust = Math.Sin(Math.PI * fireProgress);
 
         int centerX = viewport.Columns / 2 + bobX;
-        int baseY = bottom + recoil + raise;
+        int baseY = bottom + recoil + raise + pitchOffset;
 
         // Текстурный путь: PNG ствола из assets/weapons/<имя>.png.
         Texture? weaponTexture = assets?.GetWeapon(WeaponFile(player.CurrentWeapon));

@@ -16,6 +16,9 @@ internal enum MenuCommand
     /// <summary>Вернуться в игру.</summary>
     Resume,
 
+    /// <summary>Настройки сохранены кнопкой «Применить».</summary>
+    Apply,
+
     /// <summary>Выйти из игры.</summary>
     Quit
 }
@@ -29,10 +32,13 @@ internal enum MenuCommand
 internal sealed class MenuController
 {
     private const int MainItemCount = 4;
-    private const int SettingsItemCount = 9;
+    private const int SettingsItemCount = 10;
     private const int CheatsItemCount = 1 + WeaponCatalog.Count + 4;
 
-    private static readonly string[] QualityNames = { "Низкое", "Среднее", "Высокое", "Ультра" };
+    private static readonly string[] QualityNames =
+    {
+        "Низкое", "Среднее", "Высокое", "Очень высокое", "Ультра", "Экстрим", "Максимум"
+    };
 
     private static readonly string[] WeaponNames =
     {
@@ -214,6 +220,10 @@ internal sealed class MenuController
         if (hit is null)
             return MenuCommand.Nothing;
 
+        // Закреплённая кнопка «Применить» внизу панели настроек: индекс вне списка пунктов.
+        if (hit.Id == MenuEntryId.Apply)
+            return MenuCommand.Apply;
+
         SelectIndex(hit.EntryIndex);
 
         // Клик по ползунку: сразу ставим значение и начинаем перетаскивание.
@@ -237,10 +247,10 @@ internal sealed class MenuController
             return MenuCommand.Redraw;
         }
 
-        // Переключатели и кнопки активируются кликом; клик по значению опции
-        // листает варианты вперёд; в главном меню клик открывает пункт.
-        if (entry.Kind == MenuEntryKind.Toggle || entry.Kind == MenuEntryKind.Action
-                                                || entry.Kind == MenuEntryKind.Option || !Detailed)
+        // Переключатели и кнопки активируются кликом; клик по значению ОПЦИИ только выбирает
+        // строку: у опций значение меняется исключительно стрелками, иначе случайный клик
+        // по строке перескакивал уровень качества. В главном меню клик открывает пункт.
+        if (entry.Kind == MenuEntryKind.Toggle || entry.Kind == MenuEntryKind.Action || !Detailed)
         {
             return ActivateEntry(entry, player);
         }
@@ -293,6 +303,11 @@ internal sealed class MenuController
             case ConsoleKey.Enter or ConsoleKey.Spacebar:
             {
                 IReadOnlyList<MenuEntry> entries = CurrentEntries();
+
+                // Курсор на закреплённой кнопке «Применить» (индекс за пределами списка).
+                if (SelectedIndex >= entries.Count)
+                    return MenuCommand.Apply;
+
                 if (SelectedIndex < entries.Count)
                     return ActivateEntry(entries[SelectedIndex], null);
                 return MenuCommand.Nothing;
@@ -393,6 +408,7 @@ internal sealed class MenuController
         _entries.Add(Toggle("Покачивание оружия", MenuEntryId.WeaponBob, settings.WeaponBob));
         _entries.Add(Toggle("Счётчик FPS", MenuEntryId.ShowFps, settings.ShowFps));
         _entries.Add(Toggle("Авто-отдаление при старте", MenuEntryId.AutoZoom, settings.AutoZoom));
+        _entries.Add(Toggle("Разворачивать окно", MenuEntryId.MaximizeWindow, settings.AutoMaximizeWindow));
     }
 
     private void BuildCheats(Player player)
@@ -478,8 +494,10 @@ internal sealed class MenuController
         switch (entry.Id)
         {
             case MenuEntryId.Quality:
-                GameSettings.Current.Quality = (GraphicsQuality)Wrap(
-                    (int)GameSettings.Current.Quality + direction, QualityNames.Length);
+                // Без закольцованности: с «Низкого» влево раньше попадали сразу в самый
+                // мелкий масштаб («Максимум») — это и выглядело как случайный перескок.
+                GameSettings.Current.Quality = (GraphicsQuality)Math.Clamp(
+                    (int)GameSettings.Current.Quality + direction, 0, QualityNames.Length - 1);
                 break;
 
             case MenuEntryId.MouseSensitivity:
@@ -560,6 +578,13 @@ internal sealed class MenuController
             case MenuEntryId.AutoZoom:
                 GameSettings.Current.AutoZoom = !GameSettings.Current.AutoZoom;
                 return MenuCommand.Redraw;
+
+            case MenuEntryId.MaximizeWindow:
+                GameSettings.Current.AutoMaximizeWindow = !GameSettings.Current.AutoMaximizeWindow;
+                return MenuCommand.Redraw;
+
+            case MenuEntryId.Apply:
+                return MenuCommand.Apply;
 
             case MenuEntryId.GiveAll when player != null:
                 player.GiveAll();
@@ -665,7 +690,8 @@ internal sealed class MenuController
     {
         int count = Screen switch
         {
-            GameScreen.Settings => SettingsItemCount,
+            // На экране настроек последним «пунктом» ходит закреплённая кнопка «Применить».
+            GameScreen.Settings => SettingsItemCount + 1,
             GameScreen.Cheats => CheatsItemCount,
             _ => MainItemCount
         };

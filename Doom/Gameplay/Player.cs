@@ -21,6 +21,9 @@ internal sealed class Player
     /// <summary>Направление взгляда в радианах.</summary>
     public double Angle { get; private set; }
 
+    /// <summary>Наклон взгляда вверх (плюс) или вниз (минус) в радианах.</summary>
+    public double Pitch { get; private set; }
+
     public WeaponKind CurrentWeapon { get; private set; }
 
     /// <summary>Время последнего выстрела в секундах от старта.</summary>
@@ -61,6 +64,7 @@ internal sealed class Player
         X = GameConfig.StartX;
         Y = GameConfig.StartY;
         Angle = GameConfig.StartAngle;
+        Pitch = 0;
 
         Array.Clear(_ammo);
         Array.Clear(_owned);
@@ -92,6 +96,10 @@ internal sealed class Player
     }
 
     public void Turn(double deltaRadians) => Angle += deltaRadians;
+
+    /// <summary>Наклоняет взгляд по вертикали, удерживая угол в разумных пределах.</summary>
+    public void TurnPitch(double deltaRadians) =>
+        Pitch = Math.Clamp(Pitch + deltaRadians, -GameConfig.MaxPitchRadians, GameConfig.MaxPitchRadians);
 
     // ============================================================
     //   Читы: оружие и боеприпасы (используются экраном «Читы»)

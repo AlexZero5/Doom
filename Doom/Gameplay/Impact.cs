@@ -20,7 +20,10 @@ internal sealed class Impact
     /// <summary>Разброс размера (0.85..1.15), чтобы искры и дым не выглядели клонами.</summary>
     public double Scale { get; private set; } = 1.0;
 
-    public void Reset(ImpactKind kind, double x, double y, double duration, double scale)
+    /// <summary>Высота эффекта (0 — пол, 1 — потолок); след снаряда висит там, где летел снаряд.</summary>
+    public double Z { get; private set; }
+
+    public void Reset(ImpactKind kind, double x, double y, double duration, double scale, double z = 0.0)
     {
         Kind = kind;
         X = x;
@@ -28,6 +31,7 @@ internal sealed class Impact
         Age = 0;
         Duration = duration;
         Scale = scale;
+        Z = z;
     }
 
     public void Advance(double deltaSeconds) => Age += deltaSeconds;

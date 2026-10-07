@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace Doom.Platform;
 
@@ -53,9 +54,11 @@ internal static class NativeMethods
     public const uint KeyEventKeyUp = 0x0002;
 
     public const ushort VirtualKeyControl = 0x11;
+    public const ushort VirtualKey0 = 0x30;
 
     /// <summary>Клавиша «−» основной части клавиатуры (в терминале ей соответствует Ctrl+−).</summary>
     public const ushort VirtualKeyOemMinus = 0xBD;
+    public const ushort VirtualKeyOemPlus = 0xBB;
 
     /// <summary>
     ///     Входит в объединение и нужен, чтобы размер <see cref="Input" /> совпал с нативным
@@ -233,4 +236,127 @@ internal static class NativeMethods
     /// <summary>Флаги dwEventFlags мыши.</summary>
     public const uint MouseMovedFlag = 0x0001;
     public const uint MouseWheeledFlag = 0x0004;
+
+    // ============================================================
+    //   Окно консоли (разворачивание на весь экран при старте)
+    // ============================================================
+
+    public const uint SwRestore = 9;
+    public const uint SwMaximize = 3;
+    public const uint SwMinimize = 6;
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr window, uint command);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsZoomed(IntPtr window);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr window);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Rect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+
+        public bool SameAs(Rect other) =>
+            Left == other.Left && Top == other.Top && Right == other.Right && Bottom == other.Bottom;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr window, out Rect rect);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr window);
+
+    [DllImport("user32.dll")]
+    public static extern bool BringWindowToTop(IntPtr window);
+
+    /// <summary>
+    ///     Принудительная активация окна (тем же механизмом, что Alt+Tab). Не документирована,
+    ///     но живёт в user32.dll десятилетиями; если её вдруг не окажется — вызов отловится
+    ///     вызывающим кодом, и останется запасной приём со сворачиванием окна.
+    /// </summary>
+    [DllImport("user32.dll")]
+    public static extern void SwitchToThisWindow(IntPtr window, bool altTab);
+
+    // Вывести чужое окно вперёд простым SetForegroundWindow система не даёт фоновому
+    // процессу: нужно временно «присоединить» очередь ввода своего потока к потоку окна.
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint attachTo, uint attachFrom, bool attach);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetConsoleScreenBufferSize(IntPtr consoleOutput, Coord size);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr window, [Out] StringBuilder className, int maxCount);
+
+    /// <summary>
+    ///     Открывает консоль напрямую по имени <c>CONOUT$</c>. В отличие от стандартного
+    ///     вывода, этот хэндл работает, даже если stdout перенаправлен — именно поэтому
+    ///     размер окна читается и меняется корректно в любом случае.
+    /// </summary>
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateFile(
+        string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes,
+        uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+    public const uint GenericRead = 0x80000000;
+    public const uint GenericWrite = 0x40000000;
+    public const uint FileShareWrite = 0x00000002;
+    public const uint OpenExisting = 3;
+
+    // ============================================================
+    //   Поиск «своего» окна терминала (для разворота в Windows Terminal)
+    // ============================================================
+
+    public delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindow(string? className, string windowName);
+
+    public const uint Th32csSnapProcess = 0x00000002;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool Process32First(IntPtr snapshot, ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool Process32Next(IntPtr snapshot, ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr handle);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct ProcessEntry32
+    {
+        public uint Size;
+        public uint Usage;
+        public uint ProcessId;
+        public IntPtr DefaultHeapId;
+        public uint ModuleId;
+        public uint Threads;
+        public uint ParentProcessId;
+        public int PriorityClassBase;
+        public uint Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string ExeFile;
+    }
 }

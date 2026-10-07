@@ -44,6 +44,12 @@ internal sealed class AssetStore : IDisposable
     /// <summary>Текстура стены по типу клетки: assets/walls/&lt;тип&gt;.png.</summary>
     public Texture? GetWall(int tileType) => Get($"walls/{tileType}.png");
 
+    /// <summary>Текстура пола: тоже стены (6 — трава, 7 — металл, 8 — земля).</summary>
+    public Texture? GetFloor(int floorType) => Get($"walls/{floorType}.png");
+
+    /// <summary>Скайбокс: 360° панорама в assets/walls/9.png (рисунок в верхней половине).</summary>
+    public Texture? GetSkybox() => Get("walls/9.png");
+
     /// <summary>Текстура оружия: assets/weapons/&lt;имя&gt;.png.</summary>
     public Texture? GetWeapon(string name) => Get($"weapons/{name}.png");
 
@@ -70,6 +76,32 @@ internal sealed class AssetStore : IDisposable
         ResolveRoot();
         Scan();
         StartWatcher();
+        WriteDiagnostics();
+    }
+
+    /// <summary>
+    ///     Диагностика запуска: куда разрешился корень ассетов и что загрузилось.
+    ///     Пишется в консоль и в файл рядом с exe — по нему видно, почему игра
+    ///     вдруг рисует процедурщину вместо текстур.
+    /// </summary>
+    private void WriteDiagnostics()
+    {
+        Console.WriteLine(
+            $"[assets] root={RootPath} textures={_textures.Count} anims={_animations.Count}");
+
+        try
+        {
+            string line =
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | cwd={Environment.CurrentDirectory} | " +
+                $"root={RootPath} | textures={_textures.Count} | anims={_animations.Count}{Environment.NewLine}";
+
+            File.AppendAllText(
+                Path.Combine(AppContext.BaseDirectory, "assets_last_run.log"), line);
+        }
+        catch (IOException)
+        {
+            // Лог не критичен.
+        }
     }
 
     /// <summary>Применяет накопившиеся изменения файлов (вызывать из главного цикла).</summary>
@@ -94,16 +126,26 @@ internal sealed class AssetStore : IDisposable
         _watcher = null;
     }
 
-    /// <summary>Ищет assets/ вверх по дереву от рабочего каталога и папки с exe.</summary>
+    /// <summary>
+    ///     Ищет assets/ вверх по дереву от рабочего каталога и папки с exe.
+    ///     Найденный корень не мутируется: структура папок создаётся только когда
+    ///     настоящего корня нет и мы заводим новый рядом с рабочим каталогом
+    ///     (иначе однажды созданные пустые категории в чужой папке заставляют
+    ///     последующие запуски считать её корнем).
+    /// </summary>
     private void ResolveRoot()
     {
         string? root = FindUpwards(Directory.GetCurrentDirectory())
                        ?? FindUpwards(AppContext.BaseDirectory);
 
-        if (root is null)
-            root = Path.Combine(Directory.GetCurrentDirectory(), GameConfig.AssetsFolderName);
+        if (root is not null)
+        {
+            RootPath = root;
+            Directory.CreateDirectory(CacheDirectory);
+            return;
+        }
 
-        RootPath = root;
+        RootPath = Path.Combine(Directory.GetCurrentDirectory(), GameConfig.AssetsFolderName);
         Directory.CreateDirectory(RootPath);
 
         foreach (string category in FlatCategories)
@@ -120,13 +162,36 @@ internal sealed class AssetStore : IDisposable
         for (int depth = 0; depth < 6 && start is not null; depth++)
         {
             string candidate = Path.Combine(start, GameConfig.AssetsFolderName);
-            if (Directory.Exists(candidate))
+
+            // Папка должна быть ПОХОЖА на ассеты. Иначе мимо неё путь продолжается:
+            // случайный одноимённый каталог (например, Doom/Assets/ с кодом — Windows
+            // не различает регистр) не должен засчитаться и обнулить загрузку.
+            if (Directory.Exists(candidate) && LooksLikeAssetsRoot(candidate))
                 return candidate;
 
             start = Path.GetDirectoryName(start.TrimEnd(Path.DirectorySeparatorChar));
         }
 
         return null;
+    }
+
+    /// <summary>Правда ли в папке есть категории ассетов или хотя бы один PNG.</summary>
+    private static bool LooksLikeAssetsRoot(string path)
+    {
+        foreach (string category in new[] { "walls", "weapons", "sprites", "anims", "fonts" })
+        {
+            if (Directory.Exists(Path.Combine(path, category)))
+                return true;
+        }
+
+        try
+        {
+            return Directory.EnumerateFiles(path, "*.png", SearchOption.TopDirectoryOnly).Any();
+        }
+        catch (IOException)
+        {
+            return false;
+        }
     }
 
     // ============================================================

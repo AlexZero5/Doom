@@ -71,7 +71,10 @@ internal static class SpriteProjector
             ProjectileVisual visual = ProjectilePalette.Get(projectile.Kind);
             string? spriteName = ProjectileSpriteName(projectile.Kind);
 
-            AddQuad(viewport, player, projectile.X, projectile.Y, visual.BottomZ, visual.TopZ, visual.Width,
+            // Полоса спрайта симметрична вокруг центра Z: снаряд рождается на штатной
+            // высоте (у ствола) и летит по вертикали вместе с наклоном ствола.
+            AddQuad(viewport, player, projectile.X, projectile.Y,
+                projectile.Z - projectile.BandHalf, projectile.Z + projectile.BandHalf, visual.Width,
                 visual.Color, alpha: 1.0, output,
                 texture: spriteName is null ? null : assets?.GetSprite(spriteName));
         }
@@ -90,7 +93,8 @@ internal static class SpriteProjector
             double width = visual.Width * impact.Scale * (1.0 + (visual.Growth - 1.0) * progress);
             double rise = visual.Rise * impact.Age;
 
-            AddQuad(viewport, player, impact.X, impact.Y, visual.BottomZ + rise, visual.TopZ + rise, width,
+            AddQuad(viewport, player, impact.X, impact.Y,
+                visual.BottomZ + rise + impact.Z, visual.TopZ + rise + impact.Z, width,
                 visual.Color, alpha, output,
                 texture: explosion?.SampleProgress(progress) is { } frame && IsExplosion(impact.Kind)
                     ? frame
@@ -149,8 +153,11 @@ internal static class SpriteProjector
         double halfAngle = Math.Atan2(width * 0.5, distance);
         double halfColumns = viewport.Columns * halfAngle / viewport.FieldOfViewRadians;
 
-        double topY = viewport.PixelRows * 0.5 + viewport.PixelRows * (CameraZ - topZ) / distance;
-        double bottomY = viewport.PixelRows * 0.5 + viewport.PixelRows * (CameraZ - bottomZ) / distance;
+        // Горизонт сдвигается наклоном камеры: так спрайты летают по вертикали вместе со взглядом.
+        double horizon = viewport.HorizonPixels(player.Pitch);
+
+        double topY = horizon + viewport.PixelRows * (CameraZ - topZ) / distance;
+        double bottomY = horizon + viewport.PixelRows * (CameraZ - bottomZ) / distance;
 
         double perpendicularDistance = distance * Math.Cos(relativeAngle);
 

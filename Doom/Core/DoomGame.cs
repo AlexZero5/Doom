@@ -31,6 +31,9 @@ internal sealed class DoomGame
     private readonly AssetStore _assets;
     private readonly SceneRenderer _renderer;
 
+    /// <summary>Файл диагностики уже создан за этот запуск (первая строка перезаписывает старый).</summary>
+    private static bool _diagnosticsStarted;
+
     private Framebuffer _framebuffer = new(1, 1);
     private Viewport _viewport;
     private double _previousFrameTime;
@@ -50,11 +53,17 @@ internal sealed class DoomGame
     /// <summary>Сглаженное значение FPS для счётчика в строке состояния.</summary>
     private double _fps;
 
+    // Адаптивный темп презентации: см. PresentIfTerminalKeptUp.
+    private const double PresentCostCapMs = 10.0;
+    private const double PresentIntervalFactor = 1.2;
+    private double _presentCostMs;
+    private long _lastPresentTick = long.MinValue;
+
     public DoomGame()
     {
         _assets = new AssetStore();
         _renderer = new SceneRenderer(_assets);
-        _presenter = new ConsolePresenter(_terminal);
+        _presenter = new ConsolePresenter(_terminal, Terminal.IsRunningInWindowsTerminal);
         _pickups.AddRange(PickupLayout.CreateDefault());
     }
 
@@ -68,6 +77,10 @@ internal sealed class DoomGame
 
         _terminal.HideCursorAndClearScreen();
 
+        // Автоперенос выключаем: запись в последнюю ячейку строки не должна
+        // переносить курсор и скроллить экран — это рассинхронизирует кадр.
+        _terminal.DisableAutoWrap();
+
         // Ввод в сыром режиме: без QuickEdit и построчного редактирования, с VT-мышью в меню.
         _terminal.ConfigureInput();
 
@@ -76,6 +89,12 @@ internal sealed class DoomGame
             _mouse.BeginCapture();
 
         Console.CancelKeyPress += OnCancelKeyPress;
+
+        // Диагностика окружения: видно сразу в окне, какой терминал и какой режим вывода.
+        LogDiagnostics(
+            $"[doom] terminal={(Terminal.IsRunningInWindowsTerminal ? "WindowsTerminal" : "conhost")}, " +
+            $"output={(Terminal.IsRunningInWindowsTerminal || _terminal.TerminalIsWindowsTerminal ? "diff+sync" : "full-frame")}, " +
+            $"console={Terminal.DescribeConsole()}, окно терминала={_terminal.TerminalWindowReport}");
 
         _totalTimer.Restart();
         _frameTimer.Restart();
@@ -91,8 +110,37 @@ internal sealed class DoomGame
             _assets.Dispose();
             _mouse.EndCapture();
             _terminal.DisableMouseReporting();
+            _terminal.EnableAutoWrap();
             _terminal.RestoreInputMode();
             _terminal.Restore();
+        }
+    }
+
+    /// <summary>
+    ///     Печатает диагностическую строку и дублирует её в <c>doom_last_run.log</c> рядом с игрой.
+    ///     В окне эти строки жить не могут: их затирает очистка экрана и первый кадр, поэтому
+    ///     без файла по ним невозможно понять, что произошло при старте.
+    /// </summary>
+    private static void LogDiagnostics(string line)
+    {
+        Console.WriteLine(line);
+
+        try
+        {
+            string path = Path.Combine(AppContext.BaseDirectory, "doom_last_run.log");
+
+            // Каждый запуск — свой лог: старый не нужен, а копить его нельзя.
+            if (!_diagnosticsStarted)
+            {
+                _diagnosticsStarted = true;
+                File.WriteAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} запуск{Environment.NewLine}");
+            }
+
+            File.AppendAllText(path, $"    {line}{Environment.NewLine}");
+        }
+        catch (IOException)
+        {
+            // Лог не критичен: игра продолжает работать.
         }
     }
 
@@ -102,18 +150,40 @@ internal sealed class DoomGame
     /// </summary>
     private bool PrepareTerminal()
     {
-        // Загрузка скрывает «магию» с масштабом: пока она на экране, игра жмёт Ctrl+− за пользователя.
+        // Сначала разворачиваем окно (просьба игрока: «сначала развернуть, затем отдалять»),
+        // затем загрузочный экран прячет «магию» с масштабом.
+        if (GameSettings.Current.AutoMaximizeWindow)
+        {
+            _terminal.MaximizeWindow();
+            Thread.Sleep(GameConfig.MaximizeSettleMs);
+        }
+
+        // Кто нас показывает — выясняем ДО первого кадра: по этому признаку выбирается и способ
+        // смены масштаба, и режим вывода. Переменной WT_SESSION верить нельзя: когда консоль
+        // делегирована терминалу, она не выставляется, и Windows Terminal принимался за conhost.
+        _terminal.TryDetectTerminalWindow();
+        _presenter.UseSynchronizedOutput(
+            Terminal.IsRunningInWindowsTerminal || _terminal.TerminalIsWindowsTerminal);
+
         _terminal.ShowLoadingScreen();
         Thread.Sleep(GameConfig.LoadingScreenMs);
 
         bool zoomedOut = GameConfig.AutoZoomOut && GameSettings.Current.AutoZoom && _terminal.TryAutoZoomOut();
-        if (!zoomedOut)
-            _terminal.TrySetFontSize(GameConfig.DesiredFontSize);
 
-        // Окно увеличиваем, но НЕ уменьшаем: после «отдаления» шрифта то же окно вмещает больше
-        // символов, и запрос 320×100 наоборот сжал бы картинку.
-        GrowWindowToDesiredSize();
-        Thread.Sleep(GameConfig.StartupDelayMs);
+        // Окно терминала могло найтись только в ходе смены масштаба (первый поиск идёт по
+        // заголовку и не всегда успевает) — тогда самое время переключить режим вывода.
+        _presenter.UseSynchronizedOutput(
+            Terminal.IsRunningInWindowsTerminal || _terminal.TerminalIsWindowsTerminal);
+
+        // Никаких «окно должно быть 1280×720 ячеек»: этот запрос терминал не может выполнить
+        // (столько ячеек не помещается на экран), буфер оставался огромным, а видно было лишь
+        // его часть — кадр «ехал» сверху вниз и уходил за рамку. Игра просто подстраивается
+        // под то окно, которое есть.
+
+        // Ждём, пока разворот окна и смена масштаба устаканятся: замер «в моменте» давал
+        // размер, по которому нельзя было рисовать кадр.
+        Terminal.WaitForSizeStable();
+        _terminal.SyncBufferToWindow();
 
         Terminal.ReadWindowSize(out int columns, out int rows);
         Resize(columns, rows);
@@ -123,6 +193,13 @@ internal sealed class DoomGame
             Console.WriteLine("Окно консоли слишком маленькое. Нужно минимум 40x15.");
             return false;
         }
+
+        // Диагностика: по ней сразу видно, что именно применилось при старте. Пишем и в файл:
+        // на экране строки затираются первым же кадром (а часть — очисткой экрана).
+        LogDiagnostics(
+            $"[doom] quality={GameSettings.Current.Quality} " +
+            $"кадр_×{GameSettings.Current.ZoomColumnsOfBase:0.00} " +
+            $"zoom={(zoomedOut ? "ok" : "failed")} size={columns}x{rows} :: {_terminal.LastZoomReport}");
 
         // Подсказку показываем только если «отдалить» автоматически не получилось.
         if (!zoomedOut)
@@ -135,30 +212,17 @@ internal sealed class DoomGame
         return true;
     }
 
-    /// <summary>
-    ///     Увеличивает окно до желаемого размера, но никогда не уменьшает его. Если текущее окно
-    ///     уже больше 320×100 (частый случай после «отдаления» шрифта), размер не трогается, поэтому
-    ///     картинка не сжимается.
-    /// </summary>
-    private void GrowWindowToDesiredSize()
-    {
-        Terminal.ReadWindowSize(out int columns, out int rows);
-
-        int targetColumns = Math.Max(columns, GameConfig.DesiredColumns);
-        int targetRows = Math.Max(rows, GameConfig.DesiredRows);
-
-        if (targetColumns == columns && targetRows == rows)
-            return;
-
-        _terminal.TryResize(targetColumns, targetRows);
-    }
-
     /// <summary>Пересоздаёт буферы кадра под новый размер окна.</summary>
     private void Resize(int columns, int rows)
     {
         _framebuffer = new Framebuffer(columns, rows);
         _viewport = new Viewport(columns, rows);
         _presenter.EnsureCapacity(columns * rows);
+        _presenter.Reset();
+
+        // Буфер консоли выравниваем по рамке: вывод в нижнюю строку окна не должен
+        // прокручивать буфер — иначе кадр «размазывается» и уходит за рамку.
+        _terminal.SyncBufferToWindow();
     }
 
     private void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs args)
@@ -166,6 +230,7 @@ internal sealed class DoomGame
         args.Cancel = false;
         _mouse.EndCapture();
         _terminal.DisableMouseReporting();
+        _terminal.EnableAutoWrap();
         _terminal.RestoreInputMode();
         _terminal.Restore();
     }
@@ -225,11 +290,6 @@ internal sealed class DoomGame
                 case ConsoleKey.Escape:
                     OpenMenu();
                     return;
-                case ConsoleKey.OemMinus:
-                case ConsoleKey.Subtract:
-                    _terminal.TrySetFontSize((short)Math.Max(
-                        (int)GameConfig.MinimumFontSize, GameConfig.DesiredFontSize - 1));
-                    break;
 
                 // Слоты оружия 1..7: у кулака и бензопилы общий слот 1.
                 case ConsoleKey.D1 or ConsoleKey.NumPad1:
@@ -302,6 +362,11 @@ internal sealed class DoomGame
         {
             _frameTimer.Restart();
 
+            // Игрок мог зумить терминал вручную (Ctrl + колесо, Ctrl + −): калибровка
+            // восстанавливается раньше, чем кадр подстроится под чужой масштаб.
+            if (_terminal.TryRestoreUserZoom())
+                hasRendered = false;
+
             if (TryApplyWindowSize())
                 hasRendered = false;
 
@@ -362,7 +427,7 @@ internal sealed class DoomGame
             if (redraw)
             {
                 RenderFrame(nowSeconds);
-                _presenter.Present(_framebuffer);
+                PresentIfTerminalKeptUp();
                 hasRendered = true;
             }
 
@@ -375,6 +440,36 @@ internal sealed class DoomGame
 
             SleepToTargetFrameRate();
         }
+    }
+
+    /// <summary>
+    ///     Отправляет кадр терминалу, но не чаще, чем он успевает отрисовывать.
+    ///     Длительность записи в stdout (включая блокировку о переполнении трубы —
+    ///     терминал не поспевает) сглаживается в _presentCostMs; при больших кадрах
+    ///     это задаёт минимальный интервал между отправками. Пропуск отправки
+    ///     безопасен: фреймбуфер всегда хранит самый свежий кадр, а снимок
+    ///     презентера соответствует содержимому терминала.
+    /// </summary>
+    private void PresentIfTerminalKeptUp()
+    {
+        long nowTick = Environment.TickCount64;
+
+        if (_lastPresentTick != long.MinValue)
+        {
+            double minIntervalMs = _presentCostMs > PresentCostCapMs
+                ? _presentCostMs * PresentIntervalFactor
+                : 0;
+
+            if (nowTick - _lastPresentTick < minIntervalMs)
+                return; // терминал занят предыдущим кадром — покажем следующий
+        }
+
+        long start = nowTick;
+        _presenter.Present(_framebuffer);
+        long cost = Environment.TickCount64 - start;
+
+        _presentCostMs = _presentCostMs <= 0 ? cost : _presentCostMs * 0.8 + cost * 0.2;
+        _lastPresentTick = nowTick;
     }
 
     /// <summary>Рисует кадр: сцену и, если открыто меню, наложение поверх неё.</summary>
@@ -445,11 +540,39 @@ internal sealed class DoomGame
                 ResumeGame();
                 redraw = true;
                 break;
+            case MenuCommand.Apply:
+                ApplySettingsNow();
+                redraw = true;
+                break;
             case MenuCommand.Quit:
                 _quitRequested = true;
                 redraw = true;
                 break;
         }
+    }
+
+    /// <summary>
+    ///     Применяет настройки немедленно, не дожидаясь перезапуска: сохраняет в файл и
+    ///     перевызывает ВСЁ, что от них зависит — масштаб терминала (качество), угол обзора
+    ///     (вьюпорт пересоздаётся), захват мыши, а также сбрасывает снимок вывода, чтобы
+    ///     кадр перерисовался целиком. Скорость, поворот и чувствительность читаются из
+    ///     настроек каждый кадр и подхватываются сами.
+    /// </summary>
+    private void ApplySettingsNow()
+    {
+        GameSettings.Current.Save();
+
+        // Качество графики: масштаб терминала / шрифт + пересчёт окна.
+        _terminal.ApplyQualityOnFly();
+
+        // Угол обзора зашит в вьюпорт — пересоздаём его под новые настройки.
+        _viewport = new Viewport(_framebuffer.Columns, _framebuffer.Rows);
+
+        // Захват мыши применится при возврате в игру: сейчас открыто меню,
+        // и курсор должен оставаться свободным для навигации по пунктам.
+
+        // Снимок отправленного больше не соответствует экрану — следующий кадр полный.
+        _presenter.Reset();
     }
 
     /// <summary>Возвращает управление игре и применяет новые настройки (например, угол обзора).</summary>
@@ -465,15 +588,20 @@ internal sealed class DoomGame
         _terminal.DisableMouseReporting();
         _input.Clear();
 
+        // Захват — по актуальной настройке (галочку могли снять в меню).
         if (GameSettings.Current.CaptureMouse)
             _mouse.BeginCapture();
+        else
+            _mouse.EndCapture();
     }
 
     /// <summary>Обновляет состояние игрока. Возвращает <c>true</c>, если игрок что-то сделал.</summary>
     private bool UpdateWorld(double deltaSeconds, double nowSeconds, long nowMs)
     {
-        double move = GameConfig.MoveSpeed * deltaSeconds;
-        double rotate = GameConfig.RotationSpeed * deltaSeconds;
+        // Скорости берём из НАСТРОЕК (а не из констант GameConfig): иначе ползунки
+        // в меню ни на что не влияли — игра всегда ходила с заводскими параметрами.
+        double move = GameSettings.Current.MoveSpeed * deltaSeconds;
+        double rotate = GameSettings.Current.RotationSpeed * deltaSeconds;
 
         bool anyInput = false;
         bool isMoving = false;
@@ -518,10 +646,15 @@ internal sealed class DoomGame
             anyInput = true;
         }
 
-        // Горизонтальный сдвиг мыши поворачивает камеру; левая кнопка стреляет (как Space).
-        if (_mouse.DeltaX != 0)
+        // Горизонтальный сдвиг мыши поворачивает камеру, вертикальный — наклоняет взгляд;
+        // левая кнопка стреляет (как Space).
+        if (_mouse.DeltaX != 0 || _mouse.DeltaY != 0)
         {
-            _player.Turn(_mouse.DeltaX * GameConfig.MouseSensitivity);
+            // Чувствительность — из настроек, чтобы ползунок действовал сразу.
+            _player.Turn(_mouse.DeltaX * GameSettings.Current.MouseSensitivity);
+
+            // Мышь вверх (DeltaY < 0) — взгляд вверх, без инверсии.
+            _player.TurnPitch(-_mouse.DeltaY * GameSettings.Current.MouseSensitivity);
             anyInput = true;
         }
 
@@ -559,7 +692,8 @@ internal sealed class DoomGame
         }
         else if (info.Projectile != ProjectileKind.None)
         {
-            _projectiles.Launch(info.Projectile, _player.X, _player.Y, _player.Angle);
+            // Снаряд вылетает туда, куда смотрит ствол, включая наклон вверх/вниз.
+            _projectiles.Launch(info.Projectile, _player.X, _player.Y, _player.Angle, _player.Pitch);
         }
         else
         {

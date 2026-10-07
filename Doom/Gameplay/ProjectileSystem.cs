@@ -58,8 +58,13 @@ internal sealed class ProjectileSystem
         _puffSeed = 0;
     }
 
-    /// <summary>Запускает снаряд из точки игрока в направлении взгляда.</summary>
-    public void Launch(ProjectileKind kind, double x, double y, double angle)
+    /// <summary>
+    ///     Запускает снаряд из точки игрока в направлении взгляда. Наклон ствола
+    ///     (<paramref name="pitch" />) задаёт вертикальную скорость: снаряд взлетает
+    ///     к потолку или падает к полу и взрывается о них. Спрайт рождается на своей
+    ///     штатной высоте (центр полосы из каталога) — там, где рисуется ствол.
+    /// </summary>
+    public void Launch(ProjectileKind kind, double x, double y, double angle, double pitch = 0.0)
     {
         if (kind == ProjectileKind.None || _projectiles.Count >= GameConfig.MaxProjectiles)
             return;
@@ -68,13 +73,19 @@ internal sealed class ProjectileSystem
         double directionY = Math.Sin(angle);
         ProjectileInfo info = ProjectileCatalog.Get(kind);
 
+        // Вертикальная скорость из наклона взгляда: стрельба вверх уводит снаряд к потолку.
+        double velocityZ = Math.Clamp(Math.Tan(pitch), -1.0, 1.0) * info.Speed;
+
         AcquireProjectile().Reset(
             kind,
             x + directionX * GameConfig.ProjectileSpawnOffset,
             y + directionY * GameConfig.ProjectileSpawnOffset,
             directionX,
             directionY,
-            info.TrailSeconds);
+            info.TrailSeconds,
+            z: info.SpawnZCenter,
+            bandHalf: info.BandHalf,
+            velocityZ);
     }
 
     /// <summary>Искра от мгновенного выстрела: точка попадания чуть отодвинута от стены к игроку.</summary>
@@ -121,17 +132,30 @@ internal sealed class ProjectileSystem
             }
 
             projectile.Advance(deltaSeconds);
+            projectile.RaiseZ(projectile.VelocityZ * deltaSeconds);
             ProjectileInfo info = ProjectileCatalog.Get(projectile.Kind);
 
-            if (AdvanceThroughLevel(projectile, deltaSeconds, info, level) || projectile.Age >= info.Lifetime)
+            // Пол есть везде: взрыв, когда нижний край спрайта коснулся пола. Потолок —
+            // только внутри зданий: на открытом небе снаряд улетает вверх и летит дальше.
+            bool hitFloor = projectile.Z - projectile.BandHalf <= 0.02;
+            bool hitCeiling = projectile.Z + projectile.BandHalf >= 0.98
+                              && level.CeilingAt((int)projectile.X, (int)projectile.Y) > 0;
+
+            if (hitFloor || hitCeiling
+                || AdvanceThroughLevel(projectile, deltaSeconds, info, level)
+                || projectile.Age >= info.Lifetime)
             {
-                Explode(info, projectile);
+                Explode(info, projectile, hitFloor, hitCeiling);
                 _projectiles.RemoveAt(index);
                 continue;
             }
 
             if (info.TrailSeconds > 0 && projectile.TryEmitTrail(deltaSeconds, info.TrailSeconds))
-                AddImpact(info.TrailImpact, projectile.X, projectile.Y);
+            {
+                // След визуально привязан к снаряду: смещение от штатной высоты следа.
+                AddImpact(info.TrailImpact, projectile.X, projectile.Y,
+                    projectile.Z - info.SpawnZCenter);
+            }
         }
     }
 
@@ -158,11 +182,16 @@ internal sealed class ProjectileSystem
         return false;
     }
 
-    /// <summary>Взрыв снаряда: огонь, засветка кадра и разлёт клубов дыма.</summary>
-    private void Explode(ProjectileInfo info, Projectile projectile)
+    /// <summary>Взрыв снаряда: огонь, засветка кадра и разлёт клубов дыма. Осколки висят на высоте взрыва.</summary>
+    private void Explode(ProjectileInfo info, Projectile projectile, bool hitFloor, bool hitCeiling)
     {
         ImpactInfo impact = ImpactCatalog.Get(info.Impact);
-        AddImpact(info.Impact, projectile.X, projectile.Y);
+
+        // Смещение эффекта от его штатной высоты: у пола — прижат к полу, у потолка —
+        // прижат к потолку, в воздухе — там, где летел снаряд.
+        double explosionOffset = hitFloor ? -0.4 : hitCeiling ? 0.5 : projectile.Z - info.SpawnZCenter;
+
+        AddImpact(info.Impact, projectile.X, projectile.Y, explosionOffset);
         AddFlash(impact.Flash, impact.FlashSeconds, impact.FlashColor);
 
         for (int index = 0; index < impact.PuffCount; index++)
@@ -173,7 +202,8 @@ internal sealed class ProjectileSystem
             AddImpact(
                 ImpactKind.ExplosionPuff,
                 projectile.X + Math.Cos(angle) * distance,
-                projectile.Y + Math.Sin(angle) * distance);
+                projectile.Y + Math.Sin(angle) * distance,
+                explosionOffset);
         }
 
         _puffSeed++;
@@ -206,13 +236,13 @@ internal sealed class ProjectileSystem
         FlashIntensity = _flashPeak * (_flashRemaining / _flashSeconds);
     }
 
-    private void AddImpact(ImpactKind kind, double x, double y)
+    private void AddImpact(ImpactKind kind, double x, double y, double z = 0.0)
     {
         ImpactInfo info = ImpactCatalog.Get(kind);
         double scale = 0.85 + 0.30 * SpreadNoise.Unit(_impactSeed, (int)kind * 31);
         _impactSeed++;
 
-        AcquireImpact().Reset(kind, x, y, info.Duration, scale);
+        AcquireImpact().Reset(kind, x, y, info.Duration, scale, z);
     }
 
     /// <summary>Берёт снаряд для переиспользования, чтобы не мусорить в куче.</summary>

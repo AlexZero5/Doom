@@ -13,6 +13,14 @@ internal sealed class Projectile
 
     public double DirectionY { get; private set; }
 
+    /// <summary>Высота ЦЕНТРА спрайта (0 — пол, 1 — потолок); спрайт рисуется симметрично вокруг неё.</summary>
+    public double Z { get; private set; }
+
+    /// <summary>Половина высоты спрайта: нижний край полосы = Z − BandHalf, верхний = Z + BandHalf.</summary>
+    public double BandHalf { get; private set; }
+
+    public double VelocityZ { get; private set; }
+
     public double Age { get; private set; }
 
     /// <summary>Снаряд ещё летит (после взрыва слот переиспользуется).</summary>
@@ -20,13 +28,25 @@ internal sealed class Projectile
 
     private double _trailCountdown;
 
-    public void Reset(ProjectileKind kind, double x, double y, double directionX, double directionY, double trailSeconds)
+    public void Reset(
+        ProjectileKind kind,
+        double x,
+        double y,
+        double directionX,
+        double directionY,
+        double trailSeconds,
+        double z,
+        double bandHalf,
+        double velocityZ = 0.0)
     {
         Kind = kind;
         X = x;
         Y = y;
         DirectionX = directionX;
         DirectionY = directionY;
+        Z = z;
+        BandHalf = bandHalf;
+        VelocityZ = velocityZ;
         Age = 0;
         Alive = true;
         _trailCountdown = trailSeconds;
@@ -39,6 +59,8 @@ internal sealed class Projectile
         X = x;
         Y = y;
     }
+
+    public void RaiseZ(double deltaZ) => Z += deltaZ;
 
     public void Kill() => Alive = false;
 

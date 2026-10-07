@@ -3,10 +3,44 @@ using Doom.World;
 
 namespace Doom.Rendering;
 
-/// <summary>Трассировка одного луча по сетке уровня (алгоритм DDA).</summary>
+/// <summary>Сегмент стены на пути луча: попадание в один стеновой блок.</summary>
+internal readonly struct WallHit
+{
+    public WallHit(double distance, int side, int tileType, double wallX, double height)
+    {
+        Distance = distance;
+        Side = side;
+        TileType = tileType;
+        WallX = wallX;
+        Height = height;
+    }
+
+    /// <summary>Перпендикулярное расстояние до грани (без «рыбьего глаза»).</summary>
+    public double Distance { get; }
+
+    /// <summary>0 — вертикальная грань стены, 1 — горизонтальная.</summary>
+    public int Side { get; }
+
+    public int TileType { get; }
+
+    /// <summary>Дробная координата попадания вдоль стены (0..1).</summary>
+    public double WallX { get; }
+
+    /// <summary>Высота стены в долях клетки: лучи выше неё летят дальше.</summary>
+    public double Height { get; }
+}
+
+/// <summary>Трассировка луча по сетке уровня (алгоритм DDA).</summary>
 internal static class Raycaster
 {
-    public static RayHit Cast(Level level, double originX, double originY, double rayAngle)
+    /// <summary>
+    ///     Трассирует луч, собирая ДО MaxHits стеновых сегментов от ближнего к дальнему.
+    ///     Низкая стена (высота меньше единицы) записывается как попадание, но луч
+    ///     продолжает лететь над ней — так видны стены за укрытиями и ограждениями.
+    ///     Возвращает число записанных попаданий.
+    /// </summary>
+    public static int CastAll(
+        Level level, double originX, double originY, double rayAngle, Span<WallHit> hits)
     {
         double directionX = Math.Cos(rayAngle);
         double directionY = Math.Sin(rayAngle);
@@ -42,11 +76,11 @@ internal static class Raycaster
             sideDistanceY = (mapY + 1.0 - originY) * deltaY;
         }
 
-        int side = 0;
-        int tileType = 0;
+        int count = 0;
 
         for (int step = 0; step < GameConfig.MaxRaySteps; step++)
         {
+            int side;
             if (sideDistanceX < sideDistanceY)
             {
                 sideDistanceX += deltaX;
@@ -63,33 +97,51 @@ internal static class Raycaster
             if (!level.TryGetTile(mapX, mapY, out int tile))
                 break;
 
-            if (tile > 0)
-            {
-                tileType = tile;
+            if (tile == 0)
+                continue;
+
+            double perpendicularDistance = side == 0
+                ? (mapX - originX + (1 - stepX) / 2.0) / directionX
+                : (mapY - originY + (1 - stepY) / 2.0) / directionY;
+
+            if (perpendicularDistance < 0.01)
+                perpendicularDistance = 0.01;
+
+            double wallX = side == 0
+                ? originY + perpendicularDistance * directionY
+                : originX + perpendicularDistance * directionX;
+            wallX -= Math.Floor(wallX);
+
+            double height = Level.WallHeightOf(tile);
+            hits[count++] = new WallHit(perpendicularDistance, side, tile, wallX, height);
+
+            if (height >= 1.0 || count == hits.Length)
                 break;
-            }
         }
 
-        if (tileType == 0)
+        return count;
+    }
+
+    /// <summary>
+    ///     Первая стена на пути луча любой высоты (для мгновенных выстрелов и рукопашной:
+    ///     пуля упирается и в низкое укрытие).
+    /// </summary>
+    public static RayHit Cast(Level level, double originX, double originY, double rayAngle)
+    {
+        Span<WallHit> hits = stackalloc WallHit[1];
+        int count = CastAll(level, originX, originY, rayAngle, hits);
+
+        if (count == 0)
             return RayHit.Miss;
 
-        double perpendicularDistance = side == 0
-            ? (mapX - originX + (1 - stepX) / 2.0) / directionX
-            : (mapY - originY + (1 - stepY) / 2.0) / directionY;
+        WallHit hit = hits[0];
+        double directionX = Math.Cos(rayAngle);
+        double directionY = Math.Sin(rayAngle);
 
-        if (perpendicularDistance < 0.01)
-            perpendicularDistance = 0.01;
-
-        double wallX = side == 0
-            ? originY + perpendicularDistance * directionY
-            : originX + perpendicularDistance * directionX;
-
-        // Distance — параметр луча, поэтому точка попадания лежит на направлении взгляда.
-        double hitX = originX + perpendicularDistance * directionX;
-        double hitY = originY + perpendicularDistance * directionY;
-
-        wallX -= Math.Floor(wallX);
-
-        return new RayHit(perpendicularDistance, side, tileType, wallX, hitX, hitY);
+        // Точка попадания лежит на направлении взгляда (как и раньше — по дистанции луча).
+        return new RayHit(
+            hit.Distance, hit.Side, hit.TileType, hit.WallX,
+            originX + hit.Distance * directionX,
+            originY + hit.Distance * directionY);
     }
 }

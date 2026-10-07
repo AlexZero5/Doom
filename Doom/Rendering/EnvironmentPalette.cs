@@ -1,6 +1,10 @@
 namespace Doom.Rendering;
 
-/// <summary>Цвета неба и пола: вертикальные градиенты по «пикселям» кадра.</summary>
+/// <summary>
+///     Цвета неба и пола: вертикальные градиенты по «пикселям» кадра. Градиент
+///     зависит только от вертикали, поэтому считается один раз на размер кадра
+///     и дальше читается из кэша — вместо Math.Pow на каждую строку каждый кадр.
+/// </summary>
 internal static class EnvironmentPalette
 {
     private const int SkyTopR = 0x06, SkyTopG = 0x06, SkyTopB = 0x10;
@@ -12,6 +16,41 @@ internal static class EnvironmentPalette
     private const double FloorLightOffset = 2.0;
     private const double FloorMinBrightness = 0.02;
     private const double Gamma = 1.0 / 1.6;
+
+    private static int _cachedPixelRows = -1;
+    private static int[] _skyCache = Array.Empty<int>();
+    private static int[] _floorCache = Array.Empty<int>();
+
+    /// <summary>Кэш цветов неба по вертикальным «пикселям» кадра.</summary>
+    public static ReadOnlySpan<int> Sky(int pixelRows)
+    {
+        EnsureCache(pixelRows);
+        return _skyCache;
+    }
+
+    /// <summary>Кэш цветов пола по вертикальным «пикселям» кадра.</summary>
+    public static ReadOnlySpan<int> Floor(int pixelRows)
+    {
+        EnsureCache(pixelRows);
+        return _floorCache;
+    }
+
+    private static void EnsureCache(int pixelRows)
+    {
+        if (_cachedPixelRows == pixelRows)
+            return;
+
+        _skyCache = new int[pixelRows];
+        _floorCache = new int[pixelRows];
+
+        for (int pixelY = 0; pixelY < pixelRows; pixelY++)
+        {
+            _skyCache[pixelY] = SkyColor(pixelY, pixelRows);
+            _floorCache[pixelY] = FloorColor(pixelY, pixelRows);
+        }
+
+        _cachedPixelRows = pixelRows;
+    }
 
     public static int SkyColor(int pixelY, int pixelRows)
     {

@@ -22,6 +22,20 @@ internal static class GameConfig
     /// <summary>Максимум шагов DDA при трассировке луча.</summary>
     public const int MaxRaySteps = 512;
 
+    /// <summary>
+    ///     Предел взгляда вверх/вниз (радианы). Реальный предел задаёт сдвиг горизонта
+    ///     (полторы высоты кадра, см. Viewport.HorizonPixels) — при его достижении видно
+    ///     сплошной потолок или сплошной пол. Запас по радианам нужен, чтобы предел
+    ///     достигался при любой ширине кадра.
+    /// </summary>
+    public const double MaxPitchRadians = 1.1;
+
+    /// <summary>Максимум стеновых сегментов в одном луче (низкие стены пропускают луч выше себя).</summary>
+    public const int MaxWallHitsPerRay = 4;
+
+    // Текстуры полов и потолков — номера файлов в assets/walls/:
+    // 6 — трава, 7 — металл, 8 — земля; потолки берутся текстурой стены здания.
+
     private const int WideScreenColumns = 200;
     private const int MediumScreenColumns = 100;
 
@@ -34,10 +48,15 @@ internal static class GameConfig
     // ============================================================
     //   Консоль
     // ============================================================
-    public const int DesiredColumns = 1280;
-    public const int DesiredRows = 720;
+    // Размер окна игрой НЕ задаётся: терминал физически не может растянуть буфер на
+    // заведомо большее число ячеек, чем влезает на экран, — от такого запроса кадр
+    // рисовался «мимо» рамки. Игра подстраивается под фактическое окно.
+
     public const short DesiredFontSize = 8;
     public const short MinimumFontSize = 4;
+
+    /// <summary>Верхняя граница подбора шрифта, если точный размер для качества не поддерживается.</summary>
+    public const short MaximumFontSize = 24;
 
     public const int MinimumColumns = 40;
     public const int MinimumRows = 15;
@@ -61,6 +80,19 @@ internal static class GameConfig
 
     /// <summary>Пауза после эмуляции зума, чтобы терминал успел применить новый шрифт.</summary>
     public const int AutoZoomOutSettleMs = 150;
+
+    /// <summary>
+    ///     Предел нажатий «Ctrl + −» при подборе масштаба: страховка от зацикливания, если
+    ///     терминал перестал реагировать на клавиши.
+    /// </summary>
+    public const int MaxZoomDownPresses = 24;
+
+    /// <summary>Сколько раз перечитать размер кадра после нажатия, прежде чем считать, что оно не сработало.</summary>
+    public const int ZoomSettlePolls = 4;
+
+    /// <summary>Опрос стабильности размера окна после разворота/смены масштаба.</summary>
+    public const int StablePollMs = 150;
+    public const int StablePollAttempts = 20;
 
     /// <summary>Сколько держать экран загрузки, пока настраивается масштаб терминала.</summary>
     public const int LoadingScreenMs = 650;
@@ -150,6 +182,9 @@ internal static class GameConfig
 
     /// <summary>Длительность кадра анимации, если в manifest.json не задано иное.</summary>
     public const double DefaultAnimationFrameTime = 0.12;
+
+    /// <summary>Пауза после разворота окна, чтобы консоль успела пересчитать размер.</summary>
+    public const int MaximizeSettleMs = 200;
 
     /// <summary>Высота текстурного оружия как доля высоты кадра (в «пикселях»).</summary>
     public const double WeaponTextureHeightFraction = 0.45;

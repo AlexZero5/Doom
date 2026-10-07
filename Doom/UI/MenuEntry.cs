@@ -61,6 +61,12 @@ internal enum MenuEntryId
     /// <summary>Авто-отдаление при старте (переключатель).</summary>
     AutoZoom,
 
+    /// <summary>Разворачивать окно консоли при старте (переключатель).</summary>
+    MaximizeWindow,
+
+    /// <summary>Кнопка «Применить»: сохранить настройки сейчас.</summary>
+    Apply,
+
     /// <summary>Кнопка «дать всё» на экране читов.</summary>
     GiveAll,
 

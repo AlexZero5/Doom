@@ -4,15 +4,19 @@ using System.Text.Json.Serialization;
 namespace Doom.Configuration;
 
 /// <summary>
-///     Уровень «качества графики»: задаёт, насколько сильно игра «отдаляет» картинку при
-///     старте (сколько раз нажать «Ctrl + −»). Чем выше качество, тем мельче «пиксели».
+///     Уровень «качества графики»: задаёт размер «пикселей» (масштаб терминала). Чем выше
+///     качество, тем мельче «пиксели». В Windows Terminal отсчёт идёт ОТ МИНИМАЛЬНОГО
+///     масштаба (мельче некуда), в классической консоли — от размера шрифта.
 /// </summary>
 internal enum GraphicsQuality
 {
     Low,
     Medium,
     High,
-    Ultra
+    VeryHigh,
+    Ultra,
+    Extreme,
+    Maximum
 }
 
 /// <summary>Допустимые диапазоны настроек: общие и для меню, и для проверки загруженного файла.</summary>
@@ -73,14 +77,24 @@ internal sealed class GameSettings
     /// <summary>Автоматически «отдалять» картинку при старте (уменьшать шрифт терминала).</summary>
     public bool AutoZoom { get; set; } = GameConfig.AutoZoomOut;
 
-    /// <summary>Сколько раз нажать «Ctrl + −» при старте: чем выше качество, тем мельче «пиксели».</summary>
+    /// <summary>Разворачивать окно консоли на весь экран при старте.</summary>
+    public bool AutoMaximizeWindow { get; set; } = true;
+
+    /// <summary>
+    ///     Во сколько раз кадр должен быть шире ЗАВОДСКОГО (масштаб терминала 100%): чем больше,
+    ///     тем мельче «пиксели». Отсчёт идёт от заводского масштаба, а не от предела терминала:
+    ///     предел зависит от размера окна, и из-за этого уровни схлопывались в один.
+    /// </summary>
     [JsonIgnore]
-    public int ZoomOutSteps => Quality switch
+    public double ZoomColumnsOfBase => Quality switch
     {
-        GraphicsQuality.Low => 3,
-        GraphicsQuality.Medium => 6,
-        GraphicsQuality.Ultra => 12,
-        _ => 9
+        GraphicsQuality.Low => 1.00,
+        GraphicsQuality.Medium => 1.20,
+        GraphicsQuality.High => 1.45,
+        GraphicsQuality.VeryHigh => 1.70,
+        GraphicsQuality.Ultra => 2.00,
+        GraphicsQuality.Extreme => 2.30,
+        _ => 2.65 // Maximum
     };
 
     [JsonIgnore]
