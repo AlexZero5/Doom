@@ -1,52 +1,34 @@
+using Doom.World;
+
 namespace Doom.Gameplay;
 
-/// <summary>Летящий снаряд: ракета, плазменный заряд или шар BFG.</summary>
+/// <summary>Летящий снаряд: позиция и направление в 3D, возраст, таймер следа.</summary>
 internal sealed class Projectile
 {
     public ProjectileKind Kind { get; private set; }
 
-    public double X { get; private set; }
+    public Vec3 Position { get; private set; }
 
-    public double Y { get; private set; }
+    /// <summary>Единичное направление полёта.</summary>
+    public Vec3 Direction { get; private set; }
 
-    public double DirectionX { get; private set; }
+    public double X => Position.X;
 
-    public double DirectionY { get; private set; }
+    public double Y => Position.Y;
 
-    /// <summary>Высота ЦЕНТРА спрайта (0 — пол, 1 — потолок); спрайт рисуется симметрично вокруг неё.</summary>
-    public double Z { get; private set; }
-
-    /// <summary>Половина высоты спрайта: нижний край полосы = Z − BandHalf, верхний = Z + BandHalf.</summary>
-    public double BandHalf { get; private set; }
-
-    public double VelocityZ { get; private set; }
+    public double Z => Position.Z;
 
     public double Age { get; private set; }
 
-    /// <summary>Снаряд ещё летит (после взрыва слот переиспользуется).</summary>
     public bool Alive { get; private set; }
 
     private double _trailCountdown;
 
-    public void Reset(
-        ProjectileKind kind,
-        double x,
-        double y,
-        double directionX,
-        double directionY,
-        double trailSeconds,
-        double z,
-        double bandHalf,
-        double velocityZ = 0.0)
+    public void Reset(ProjectileKind kind, Vec3 position, Vec3 direction, double trailSeconds)
     {
         Kind = kind;
-        X = x;
-        Y = y;
-        DirectionX = directionX;
-        DirectionY = directionY;
-        Z = z;
-        BandHalf = bandHalf;
-        VelocityZ = velocityZ;
+        Position = position;
+        Direction = direction;
         Age = 0;
         Alive = true;
         _trailCountdown = trailSeconds;
@@ -54,17 +36,11 @@ internal sealed class Projectile
 
     public void Advance(double deltaSeconds) => Age += deltaSeconds;
 
-    public void MoveTo(double x, double y)
-    {
-        X = x;
-        Y = y;
-    }
-
-    public void RaiseZ(double deltaZ) => Z += deltaZ;
+    public void MoveTo(Vec3 position) => Position = position;
 
     public void Kill() => Alive = false;
 
-    /// <summary>Пора ли оставить очередной след (дым или искру).</summary>
+    /// <summary>Пора ли оставить очередной клуб следа.</summary>
     public bool TryEmitTrail(double deltaSeconds, double interval)
     {
         _trailCountdown -= deltaSeconds;

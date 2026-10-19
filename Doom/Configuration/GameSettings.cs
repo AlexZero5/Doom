@@ -4,9 +4,9 @@ using System.Text.Json.Serialization;
 namespace Doom.Configuration;
 
 /// <summary>
-///     Уровень «качества графики»: задаёт размер «пикселей» (масштаб терминала). Чем выше
-///     качество, тем мельче «пиксели». В Windows Terminal отсчёт идёт ОТ МИНИМАЛЬНОГО
-///     масштаба (мельче некуда), в классической консоли — от размера шрифта.
+///     Масштаб терминала («отдаление» шрифта). Игра всегда отдаляет до максимума: качество
+///     трёхмерного вида задаёт <see cref="GameSettings.RenderScale" />, а HUD и меню рисуются в
+///     полном разрешении терминала.
 /// </summary>
 internal enum GraphicsQuality
 {
@@ -24,12 +24,18 @@ internal static class SettingsRanges
 {
     public const double MouseSensitivityMin = 0.0005;
     public const double MouseSensitivityMax = 0.0100;
-    public const double MoveSpeedMin = 1.0;
-    public const double MoveSpeedMax = 8.0;
+    public const double MoveSpeedMin = 2.0;
+    public const double MoveSpeedMax = 12.0;
     public const double RotationSpeedMin = 0.5;
     public const double RotationSpeedMax = 5.0;
-    public const double FieldOfViewMin = 40.0;
-    public const double FieldOfViewMax = 110.0;
+    public const double FieldOfViewMin = 50.0;
+    public const double FieldOfViewMax = 120.0;
+
+    /// <summary>
+    ///     Варианты разрешения трёхмерного вида: во сколько раз внутренний кадр меньше терминала
+    ///     (1 — пиксель в пиксель, 4 — один «пиксель» на 4×4).
+    /// </summary>
+    public static readonly double[] RenderScales = { 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0 };
 }
 
 /// <summary>
@@ -47,16 +53,32 @@ internal sealed class GameSettings
         Converters = { new JsonStringEnumConverter() }
     };
 
-    /// <summary>Текущие настройки (один экземпляр на процесс).</summary>
-    public static GameSettings Current { get; private set; } = new();
+    /// <summary>
+    ///     Версия формата настроек. 2 — камера стала честной (сброс угла обзора). 3 — мир в метрах:
+    ///     скорость ходьбы — в м/с (сбрасывается), качество графики стало разрешением вида.
+    /// </summary>
+    private const int CurrentVersion = 3;
 
-    /// <summary>Качество графики: влияет на «отдаление» картинки при старте.</summary>
-    public GraphicsQuality Quality { get; set; } = GraphicsQuality.High;
+    /// <summary>Текущие настройки (один экземпляр на процесс).</summary>
+    public static GameSettings Current { get; private set; } = new() { Version = CurrentVersion };
+
+    /// <summary>Версия формата файла (для миграции; в старых файлах её нет — читается как 0).</summary>
+    public int Version { get; set; }
+
+    /// <summary>Масштаб терминала: всегда максимальный (самые мелкие «пиксели»).</summary>
+    [JsonIgnore]
+    public GraphicsQuality Quality => GraphicsQuality.Maximum;
+
+    /// <summary>
+    ///     Разрешение трёхмерного вида: во сколько раз внутренний кадр меньше окна. Больше —
+    ///     грубее картинка, меньше работы и меньше байтов терминалу.
+    /// </summary>
+    public double RenderScale { get; set; } = 2.0;
 
     /// <summary>Чувствительность мыши: радианы поворота на пиксель сдвига.</summary>
     public double MouseSensitivity { get; set; } = GameConfig.MouseSensitivity;
 
-    /// <summary>Скорость ходьбы игрока.</summary>
+    /// <summary>Скорость ходьбы игрока, м/с.</summary>
     public double MoveSpeed { get; set; } = GameConfig.MoveSpeed;
 
     /// <summary>Скорость поворота стрелками.</summary>
@@ -68,8 +90,23 @@ internal sealed class GameSettings
     /// <summary>Захватывать курсор во время игры.</summary>
     public bool CaptureMouse { get; set; } = GameConfig.CaptureMouse;
 
+    /// <summary>
+    ///     Прятать курсор в игре и не давать мыши выделять текст терминала: под курсором
+    ///     держится невидимое окно-«шторка», клики попадают в него, а не в терминал.
+    /// </summary>
+    public bool HideCursor { get; set; } = true;
+
     /// <summary>Покачивание оружия при ходьбе.</summary>
     public bool WeaponBob { get; set; } = true;
+
+    /// <summary>Прицел в центре экрана.</summary>
+    public bool Crosshair { get; set; } = true;
+
+    /// <summary>
+    ///     Сильнее упрощать кадр в движении. Само упрощение включено всегда (это оптимизация:
+    ///     пока камера движется, мелких деталей всё равно не разглядеть); галка делает его грубее.
+    /// </summary>
+    public bool StrongMotionSimplify { get; set; }
 
     /// <summary>Показывать счётчик FPS в строке состояния.</summary>
     public bool ShowFps { get; set; }
@@ -82,8 +119,7 @@ internal sealed class GameSettings
 
     /// <summary>
     ///     Во сколько раз кадр должен быть шире ЗАВОДСКОГО (масштаб терминала 100%): чем больше,
-    ///     тем мельче «пиксели». Отсчёт идёт от заводского масштаба, а не от предела терминала:
-    ///     предел зависит от размера окна, и из-за этого уровни схлопывались в один.
+    ///     тем мельче «пиксели». Отсчёт идёт от заводского масштаба, а не от предела терминала.
     /// </summary>
     [JsonIgnore]
     public double ZoomColumnsOfBase => Quality switch
@@ -130,6 +166,16 @@ internal sealed class GameSettings
             if (loaded is null)
                 return;
 
+            if (loaded.Version < 2)
+                loaded.FieldOfViewDegrees = GameConfig.FieldOfViewDegrees;
+
+            if (loaded.Version < 3)
+            {
+                loaded.MoveSpeed = GameConfig.MoveSpeed;
+                loaded.RenderScale = 2.0;
+            }
+
+            loaded.Version = CurrentVersion;
             loaded.ClampToValidRanges();
             Current = loaded;
         }
@@ -146,5 +192,7 @@ internal sealed class GameSettings
         MoveSpeed = Math.Clamp(MoveSpeed, SettingsRanges.MoveSpeedMin, SettingsRanges.MoveSpeedMax);
         RotationSpeed = Math.Clamp(RotationSpeed, SettingsRanges.RotationSpeedMin, SettingsRanges.RotationSpeedMax);
         FieldOfViewDegrees = Math.Clamp(FieldOfViewDegrees, SettingsRanges.FieldOfViewMin, SettingsRanges.FieldOfViewMax);
+        double requested = RenderScale;
+        RenderScale = SettingsRanges.RenderScales.MinBy(scale => Math.Abs(scale - requested));
     }
 }

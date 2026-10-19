@@ -20,7 +20,4 @@ internal static class Ansi
     /// </summary>
     public const string DisableAutoWrap = "\x1b[?7l";
     public const string EnableAutoWrap = "\x1b[?7h";
-
-    /// <summary>Запрос на изменение размеров окна терминала.</summary>
-    public static string Resize(int columns, int rows) => $"\x1b[8;{rows};{columns}t";
 }

@@ -5,96 +5,107 @@ using Doom.Rendering;
 namespace Doom.UI;
 
 /// <summary>
-///     Рисует меню теми же «пикселями» (символ ▀), что и игровая сцена: панель, рамка,
-///     заголовок и пункты собираются из пикселей и растрового шрифта, поэтому меню
-///     масштабируется вместе с экраном и выглядит частью игры, а не Console.WriteLine.
+///     Меню поверх затемнённой сцены: логотип, металлическая рамка-панель (ui/panel, растяжение
+///     «9 частями»), анимированный череп-указатель, пункты растровым шрифтом с заливками
+///     (обычная / при наведении / заголовок / значения), ползунки и переключатели из картинок.
+///     Всё рисуется «пикселями» кадра и масштабируется целым множителем.
 /// </summary>
 internal static class MenuRenderer
 {
-    private const int PanelBackground = 0x0E1526;
-    private const int PanelShadow = 0x000000;
-    private const int BorderColor = 0x4A90D9;
-    private const int DividerColor = 0x24405E;
+    // Цвета запасного вида (если картинок нет) и подложек.
+    private const int PanelBackground = 0x1c1e24;
+    private const int BorderColor = 0x6c5a48;
     private const int TitleColor = 0xFFD24A;
     private const int TextColor = 0xD8DEEA;
     private const int ValueColor = 0x8FD8FF;
     private const int HintColor = 0x8A93A8;
     private const int HintBackground = 0x05070C;
-    private const int SelectedForeground = 0x10131F;
-    private const int SelectedBackground = 0xFFD24A;
-    private const int HoverBackground = 0x1D2C4E;
-    private const int HoverForeground = 0xFFFFFF;
-    private const int SliderFill = 0x3AD2FF;
-    private const int SliderTrack = 0x2A3550;
-    private const int KnobColor = 0xFFFFFF;
-    private const int KnobBorder = 0x0A0A14;
-    private const int BoxOffColor = 0x5A6B8C;
-    private const int ScrollColor = 0x5A6B8C;
+    private const int SelectedBackground = 0x3a1810;
+    private const int HoverBackground = 0x24201c;
 
-    // Метрики раскладки в «пикселях» меню.
-    private const int Padding = 6;
-    private const int TitleHeight = 14;
-    private const int TitleGap = 6;
-    private const int ItemGap = 2;
-    private const int BarHeight = 9;
-    private const int SimpleStep = BarHeight + ItemGap;
-    private const int DetailedStep = BarHeight + 8 + ItemGap;
-    private const int TrackWidth = 56;
+    private const int PanelBorder = 12;
+    private const int TrackWidth = 64;
+    private const int ApplyButtonGap = 4;
 
-    /// <summary>Отступ над закреплённой кнопкой «Применить» и её высота.</summary>
-    private const int ApplyButtonGap = 3;
+    private static BitmapFont? _font;
+    private static AssetStore? _fontAssets;
+    private static int _fontVersion = -1;
 
-    /// <summary>Отрисовывает меню поверх уже готового кадра и сохраняет раскладку для мыши.</summary>
-    public static void Draw(Framebuffer framebuffer, MenuController menu, Player player, AssetStore? assets = null)
+    /// <summary>Отрисовывает меню поверх готового кадра и сохраняет раскладку для мыши.</summary>
+    public static void Draw(Framebuffer framebuffer, MenuController menu, Player player, AssetStore? assets = null,
+        double nowSeconds = 0)
     {
         Dim(framebuffer);
 
+        BitmapFont? font = FontFor(assets);
+        var text = new MenuText(font, assets);
         IReadOnlyList<MenuEntry> entries = menu.BuildEntries(player);
         var canvas = new PixelCanvas(framebuffer);
 
-        // Заливки шрифта: обычное состояние и hover. Нет текстур — сплошные цвета.
-        Texture? normalFill = assets?.GetFont("menu_normal");
-        Texture? hoverFill = assets?.GetFont("menu_hover");
+        int lineHeight = text.LineHeight;
+        int padding = PanelBorder;
+        int barHeight = lineHeight + 2;
+        int titleHeight = lineHeight + 4;
+        const int titleGap = 4;
+        int simpleStep = barHeight + 4;
+        int detailedStep = barHeight + 15;
 
         bool detailed = menu.Detailed;
-        int step = detailed ? DetailedStep : SimpleStep;
-
-        // На экране настроек внизу панели закреплена кнопка «Применить» —
-        // всегда видна, скроллится только список пунктов.
+        int step = detailed ? detailedStep : simpleStep;
         bool showApplyButton = menu.Screen == GameScreen.Settings;
-        int buttonZone = showApplyButton ? ApplyButtonGap + BarHeight : 0;
+        int buttonZone = showApplyButton ? ApplyButtonGap + barHeight : 0;
 
-        int contentWidth = MeasureContent(entries, detailed);
-        int panelWidth = Math.Max(contentWidth + Padding * 2, PixelFont.Measure("ПРИМЕНИТЬ") + 24);
+        int contentWidth = MeasureContent(entries, detailed, text);
+        int panelWidth = Math.Max(contentWidth + padding * 2, text.Measure("ПРИМЕНИТЬ") + 40);
 
-        // Масштаб: самый крупный, при котором панель влезает и не съедает весь экран.
+        Texture? logo = menu.Screen == GameScreen.MainMenu ? assets?.GetUi("logo") : null;
+        int hintZone = lineHeight + 3;
+        int usableHeight = Math.Max(1, canvas.Height - hintZone);
+        int chrome = titleHeight + titleGap + padding * 2 + buttonZone;
+
+        // Масштаб: самый крупный, при котором все пункты влезают над подсказкой и не съедают
+        // экран целиком. Не влезает даже в ×1 — сначала убираем логотип, потом включаем прокрутку.
         int scale = 1;
-        int maxVisible = Math.Max(1, (canvas.Height - (TitleHeight + TitleGap + Padding)) / step);
+        int logoZone = 0;
+        int maxVisible = Math.Clamp((usableHeight - chrome) / step, 1, entries.Count);
+        bool found = false;
 
-        foreach (int candidate in new[] { 4, 3, 2 })
+        foreach (bool withLogo in logo is null ? new[] { false } : new[] { true, false })
         {
-            int visible = Math.Min(entries.Count,
-                Math.Max(1, (canvas.Height / candidate
-                             - (TitleHeight + TitleGap + Padding + buttonZone)) / step));
-            int candidateHeight = TitleHeight + TitleGap + visible * step + Padding + buttonZone;
-
-            if (panelWidth * candidate <= canvas.Width
-                && candidateHeight * candidate <= canvas.Height
-                && panelWidth * candidate <= canvas.Width * 68 / 100
-                && candidateHeight * candidate <= canvas.Height * 95 / 100)
+            int zone = withLogo ? logo!.Height + 6 : 0;
+            int width = Math.Max(panelWidth, withLogo ? logo!.Width : 0);
+            foreach (int candidate in new[] { 4, 3, 2, 1 })
             {
-                scale = candidate;
-                maxVisible = visible;
-                break;
+                int height = chrome + entries.Count * step + zone;
+                bool fitsWidth = width * candidate <= canvas.Width * (candidate == 1 ? 100 : 80) / 100;
+                bool fitsHeight = height * candidate <= usableHeight * (candidate == 1 ? 100 : 94) / 100;
+                if (fitsWidth && fitsHeight)
+                {
+                    scale = candidate;
+                    logoZone = zone;
+                    maxVisible = entries.Count;
+                    found = true;
+                    break;
+                }
             }
+
+            if (found)
+                break;
         }
 
-        maxVisible = Math.Min(maxVisible, entries.Count);
+        if (!found)
+            logo = null;
+
         menu.MaxVisible = maxVisible;
 
-        int panelHeight = TitleHeight + TitleGap + maxVisible * step + Padding + buttonZone;
+        int panelHeight = titleHeight + titleGap + maxVisible * step + padding * 2 + buttonZone;
+        int totalHeight = panelHeight + logoZone;
         int panelLeft = Math.Max(0, (canvas.Width / scale - panelWidth) / 2);
-        int panelTop = Math.Max(1, (canvas.Height / scale - panelHeight) / 2);
+        int top = Math.Max(1, (usableHeight / scale - totalHeight) / 2);
+        int panelTop = top + logoZone;
+
+        if (logo is not null)
+            canvas.Image(logo, (canvas.Width / scale - logo.Width) / 2 * scale, top * scale, scale);
 
         var layout = new MenuLayout
         {
@@ -105,11 +116,16 @@ internal static class MenuRenderer
             PanelHeight = panelHeight
         };
 
-        DrawPanel(canvas, panelLeft, panelTop, panelWidth, panelHeight, menu.Title, scale, hoverFill);
+        DrawPanel(canvas, assets, panelLeft, panelTop, panelWidth, panelHeight, scale);
 
-        int contentLeft = panelLeft + Padding;
-        int contentRight = panelLeft + panelWidth - Padding;
-        int contentTop = panelTop + TitleHeight + TitleGap;
+        // Заголовок — огненной заливкой, по центру.
+        int titleWidth = text.Measure(menu.Title);
+        text.Draw(canvas, (panelLeft + (panelWidth - titleWidth) / 2) * scale, (panelTop + padding - 2) * scale,
+            menu.Title, "fill_title", TitleColor, scale);
+
+        int contentLeft = panelLeft + padding;
+        int contentRight = panelLeft + panelWidth - padding;
+        int contentTop = panelTop + padding + titleHeight + titleGap;
         int first = Math.Clamp(menu.First, 0, Math.Max(0, entries.Count - maxVisible));
 
         for (int visible = 0; visible < maxVisible; visible++)
@@ -122,7 +138,7 @@ internal static class MenuRenderer
             bool isSelected = entryIndex == menu.SelectedIndex;
             bool isHovered = entryIndex == menu.HoverIndex;
             int barTop = contentTop + visible * step;
-            int controlTop = barTop + BarHeight + 1;
+            int controlTop = barTop + barHeight + 1;
 
             var geometry = new MenuLayout.MenuItemGeom
             {
@@ -130,360 +146,282 @@ internal static class MenuRenderer
                 Id = entry.Id,
                 Param = entry.Param,
                 BarTop = barTop,
-                BarBottom = entry.Kind == MenuEntryKind.Action || !detailed
-                    ? barTop + BarHeight
-                    : controlTop + 8,
+                BarBottom = entry.Kind == MenuEntryKind.Action || !detailed ? barTop + barHeight : controlTop + 12,
                 ContentLeft = contentLeft,
                 ContentRight = contentRight
             };
 
             layout.Items.Add(geometry);
 
+            bool lit = isSelected || isHovered;
+            if (detailed && lit)
+                canvas.Rect(contentLeft * scale, barTop * scale, (contentRight - contentLeft) * scale, (geometry.BarBottom - barTop) * scale,
+                    isSelected ? SelectedBackground : HoverBackground);
+
             switch (entry.Kind)
             {
                 case MenuEntryKind.Action:
-                    DrawActionButton(canvas, geometry, entry, isSelected, isHovered, scale,
-                        normalFill, hoverFill);
+                {
+                    int width = text.Measure(entry.Label) + 12;
+                    int x = contentLeft + Math.Max(0, (contentRight - contentLeft - width) / 2);
+                    canvas.FrameRect(x * scale, barTop * scale, width * scale, barHeight * scale, lit ? TitleColor : BorderColor);
+                    text.Draw(canvas, (x + 6) * scale, (barTop + 1) * scale, entry.Label, lit ? "fill_hover" : "fill_normal", TextColor, scale);
                     break;
+                }
 
                 case MenuEntryKind.Slider when detailed:
-                    DrawLabelRow(canvas, geometry, entry.Label, isSelected, isHovered, scale,
-                        normalFill, hoverFill);
-                    DrawSlider(canvas, geometry, entry, controlTop, scale);
+                    text.Draw(canvas, contentLeft * scale, (barTop + 1) * scale, entry.Label, lit ? "fill_hover" : "fill_normal", TextColor, scale);
+                    DrawSlider(canvas, assets, text, geometry, entry, controlTop, scale);
                     break;
 
                 case MenuEntryKind.Option when detailed:
-                    DrawLabelRow(canvas, geometry, entry.Label, isSelected, isHovered, scale,
-                        normalFill, hoverFill);
-                    DrawOption(canvas, geometry, entry, controlTop, isHovered, scale);
+                    text.Draw(canvas, contentLeft * scale, (barTop + 1) * scale, entry.Label, lit ? "fill_hover" : "fill_normal", TextColor, scale);
+                    DrawOption(canvas, text, geometry, entry, controlTop, scale);
                     break;
 
                 case MenuEntryKind.Toggle when detailed:
-                    DrawLabelRow(canvas, geometry, entry.Label, isSelected, isHovered, scale,
-                        normalFill, hoverFill);
-                    DrawToggle(canvas, geometry, entry, controlTop, scale);
+                    text.Draw(canvas, contentLeft * scale, (barTop + 1) * scale, entry.Label, lit ? "fill_hover" : "fill_normal", TextColor, scale);
+                    DrawToggle(canvas, assets, text, geometry, entry, controlTop, scale);
                     break;
 
                 default:
-                    DrawLabelRow(canvas, geometry, entry.Label, isSelected, isHovered, scale,
-                        normalFill, hoverFill, withPointer: true);
+                {
+                    // Главное меню: пункт по центру, череп-указатель слева от выбранного.
+                    int width = text.Measure(entry.Label);
+                    int x = contentLeft + Math.Max(16, (contentRight - contentLeft - width) / 2);
+                    if (lit)
+                        DrawSkull(canvas, assets, (x - 17) * scale, (barTop - 1) * scale, scale, nowSeconds);
+                    text.Draw(canvas, x * scale, (barTop + 1) * scale, entry.Label, lit ? "fill_hover" : "fill_normal", TextColor, scale);
                     break;
+                }
             }
         }
 
-        // Закреплённая кнопка «Применить»: всегда видна внизу панели настроек,
-        // независимо от прокрутки списка. Индекс — сразу за последним пунктом.
         if (showApplyButton)
         {
-            int buttonBarTop = panelTop + panelHeight - Padding - BarHeight;
-
-            var buttonGeometry = new MenuLayout.MenuItemGeom
+            int buttonTop = panelTop + panelHeight - padding - barHeight;
+            var button = new MenuLayout.MenuItemGeom
             {
                 EntryIndex = entries.Count,
                 Id = MenuEntryId.Apply,
-                BarTop = buttonBarTop,
-                BarBottom = buttonBarTop + BarHeight,
+                BarTop = buttonTop,
+                BarBottom = buttonTop + barHeight,
                 ContentLeft = contentLeft,
                 ContentRight = contentRight
             };
 
-            layout.Items.Add(buttonGeometry);
-            DrawApplyButton(canvas, buttonGeometry, menu.HoverIndex == entries.Count, scale);
+            layout.Items.Add(button);
+            bool lit = menu.HoverIndex == entries.Count || menu.SelectedIndex == entries.Count;
+            int width = text.Measure("ПРИМЕНИТЬ") + 14;
+            int x = contentLeft + Math.Max(0, (contentRight - contentLeft - width) / 2);
+            if (lit)
+                canvas.Rect(x * scale, buttonTop * scale, width * scale, barHeight * scale, SelectedBackground);
+            canvas.FrameRect(x * scale, buttonTop * scale, width * scale, barHeight * scale, lit ? TitleColor : BorderColor);
+            text.Draw(canvas, (x + 7) * scale, (buttonTop + 1) * scale, "ПРИМЕНИТЬ", lit ? "fill_hover" : "fill_normal", TextColor, scale);
         }
 
-        DrawScrollIndicators(canvas, panelLeft, panelWidth, contentTop, first, maxVisible,
-            entries.Count, step, scale);
-        DrawHint(canvas, menu.Hint, canvas.Width / scale, canvas.Height / scale, scale);
+        DrawScrollMarks(canvas, panelLeft, panelWidth, contentTop, first, maxVisible, entries.Count, step, scale);
+        DrawHint(canvas, text, menu.Hint);
 
         menu.Layout = layout;
     }
 
-    /// <summary>Считает ширину содержимого: подписи, ползунки, значения.</summary>
-    private static int MeasureContent(IReadOnlyList<MenuEntry> entries, bool detailed)
+    private static BitmapFont? FontFor(AssetStore? assets)
     {
-        int width = 24;
+        int version = assets?.Version ?? -2;
+        if (!ReferenceEquals(assets, _fontAssets) || version != _fontVersion)
+        {
+            _font = BitmapFont.Load(assets);
+            _fontAssets = assets;
+            _fontVersion = version;
+        }
 
+        return _font;
+    }
+
+    /// <summary>Считает ширину содержимого: подписи, ползунки, значения.</summary>
+    private static int MeasureContent(IReadOnlyList<MenuEntry> entries, bool detailed, MenuText text)
+    {
+        int width = 60;
         foreach (MenuEntry entry in entries)
         {
-            int controlWidth = entry.Kind switch
+            int control = entry.Kind switch
             {
-                MenuEntryKind.Action => PixelFont.Measure(entry.Label) + 14,
-                MenuEntryKind.Slider when detailed => TrackWidth + 4 + PixelFont.Measure(entry.Value),
-                MenuEntryKind.Option when detailed => 5 + 8 + PixelFont.Measure(entry.Value) + 8 + 5,
-                MenuEntryKind.Toggle when detailed => 7 + 4 + PixelFont.Measure(entry.Value),
+                MenuEntryKind.Slider when detailed => TrackWidth + 8 + text.Measure(entry.Value),
+                MenuEntryKind.Option when detailed => 30 + text.Measure(entry.Value),
+                MenuEntryKind.Toggle when detailed => 16 + text.Measure(entry.Value),
                 _ => 0
             };
 
-            int labelWidth = 8 + PixelFont.Measure(entry.Label);
-            width = Math.Max(width, Math.Max(controlWidth, labelWidth));
+            width = Math.Max(width, Math.Max(control, text.Measure(entry.Label) + (detailed ? 4 : 40)));
         }
 
         return width;
     }
 
-    /// <summary>Затемняет готовый кадр, чтобы меню читалось поверх сцены.</summary>
+    /// <summary>Затемняет кадр, чтобы меню читалось поверх сцены (с тёплым оттенком).</summary>
     private static void Dim(Framebuffer framebuffer)
     {
         int cells = framebuffer.Columns * framebuffer.Rows;
-
         for (int index = 0; index < cells; index++)
         {
-            framebuffer.Foreground[index] = ColorRgb.Blend(framebuffer.Foreground[index], 0x000000, 0.55);
-            framebuffer.Background[index] = ColorRgb.Blend(framebuffer.Background[index], 0x000000, 0.55);
+            framebuffer.Foreground[index] = ColorRgb.Blend(framebuffer.Foreground[index], 0x0c0606, 0.62);
+            framebuffer.Background[index] = ColorRgb.Blend(framebuffer.Background[index], 0x0c0606, 0.62);
         }
     }
 
-    /// <summary>Панель с тенью, рамкой, заголовком и разделителем.</summary>
-    private static void DrawPanel(PixelCanvas canvas, int left, int top, int width, int height,
-        string title, int scale, Texture? titleFill)
+    /// <summary>Рамка-панель «9 частями»: уголки как есть, края и середина повторяются.</summary>
+    private static void DrawPanel(PixelCanvas canvas, AssetStore? assets, int left, int top, int width, int height, int scale)
     {
-        int s = scale;
+        // Тень панели.
+        for (int y = top + 3; y < top + height + 3; y++)
+        for (int x = left + 3; x < left + width + 3; x++)
+            canvas.BlendPixel(x * scale, y * scale, 0, 0.6);
 
-        // Тень: смещена вправо-вниз и полупрозрачна.
-        for (int y = top + 2; y < top + height + 2; y++)
+        Texture? panel = assets?.GetUi("panel");
+        if (panel is null)
         {
-            for (int x = left + 2; x < left + width + 2; x++)
-                canvas.BlendPixel(x * s, y * s, PanelShadow, 0.5);
+            canvas.Rect(left * scale, top * scale, width * scale, height * scale, PanelBackground);
+            canvas.FrameRect(left * scale, top * scale, width * scale, height * scale, BorderColor);
+            return;
         }
 
-        canvas.Rect(left * s, top * s, width * s, height * s, PanelBackground);
-        canvas.FrameRect(left * s, top * s, width * s, height * s, BorderColor);
+        int b = PanelBorder;
+        int inner = panel.Width - b * 2;
+        int[] sx = { 0, b, panel.Width - b };
+        int[] sw = { b, inner, b };
+        int[] dx = { left, left + b, left + width - b };
+        int[] dw = { b, width - b * 2, b };
+        int[] sy = { 0, b, panel.Height - b };
+        int[] sh = { b, panel.Height - b * 2, b };
+        int[] dy = { top, top + b, top + height - b };
+        int[] dh = { b, height - b * 2, b };
 
-        int titleWidth = PixelFont.Measure(title) * 2;
-        int titleX = (left + Math.Max(1, (width - titleWidth) / 2)) * s;
-        int titleY = (top + 2) * s;
+        for (int row = 0; row < 3; row++)
+        for (int column = 0; column < 3; column++)
+            canvas.Tile(panel, sx[column], sy[row], sw[column], sh[row],
+                dx[column] * scale, dy[row] * scale, dw[column] * scale, dh[row] * scale, scale);
+    }
 
-        if (titleFill is not null)
-            canvas.TextFilled(titleX, titleY, title, titleFill, TitleColor, 2 * s);
+    /// <summary>Череп-указатель: два кадра, глаза мигают раз в 0.3 секунды.</summary>
+    private static void DrawSkull(PixelCanvas canvas, AssetStore? assets, int x, int y, int scale, double now)
+    {
+        Texture? skull = assets?.GetUi(((int)(now / 0.3) & 1) == 0 ? "skull_0" : "skull_1");
+        if (skull is not null)
+            canvas.Image(skull, x, y, scale);
         else
-            canvas.TextScaled(titleX, titleY, title, TitleColor, 2 * s);
-
-        int dividerY = (top + TitleHeight + TitleGap - 2) * s;
-        canvas.Rect((left + 1) * s, dividerY, (width - 2) * s, s, DividerColor);
+            canvas.Text(x + 6 * scale, y + 3 * scale, "►", TitleColor, scale);
     }
 
-    /// <summary>
-    ///     Строка подписи пункта: выбранная — тёмный текст на золоте, под курсором —
-    ///     hover-заливка, обычная — заливка menu_normal. Нет текстур — сплошные цвета.
-    /// </summary>
-    private static void DrawLabelRow(PixelCanvas canvas, MenuLayout.MenuItemGeom geometry, string label,
-        bool selected, bool hovered, int scale, Texture? normalFill, Texture? hoverFill,
-        bool withPointer = false)
+    /// <summary>Ползунок: жёлоб, раскалённое заполнение, стальная ручка и значение справа.</summary>
+    private static void DrawSlider(PixelCanvas canvas, AssetStore? assets, MenuText text, MenuLayout.MenuItemGeom geometry,
+        MenuEntry entry, int controlTop, int scale)
     {
-        int s = scale;
-        string text = label.ToUpperInvariant();
-
-        (int background, int foreground) = (selected, hovered) switch
-        {
-            (true, _) => (SelectedBackground, SelectedForeground),
-            (false, true) => (HoverBackground, HoverForeground),
-            _ => (PanelBackground, TextColor)
-        };
-
-        canvas.Rect(geometry.ContentLeft * s, geometry.BarTop * s,
-            (geometry.ContentRight - geometry.ContentLeft) * s, BarHeight * s, background);
-
-        int x = geometry.ContentLeft;
-        int textY = (geometry.BarTop + 1) * s;
-
-        if (withPointer)
-        {
-            if (selected || hovered)
-                canvas.Text(x * s, textY, "►",
-                    selected ? SelectedForeground : HoverForeground, s);
-
-            x += 8;
-        }
-
-        if (selected || normalFill is null && hoverFill is null)
-        {
-            canvas.Text(x * s, textY, text, foreground, s);
-        }
-        else
-        {
-            // Выбранная строка остаётся тёмной на золоте; остальным — заливки.
-            Texture? fill = hovered ? hoverFill ?? normalFill : normalFill ?? hoverFill;
-            if (fill is not null && !selected)
-                canvas.TextFilled(x * s, textY, text, fill, foreground, s);
-            else
-                canvas.Text(x * s, textY, text, foreground, s);
-        }
-    }
-
-    /// <summary>Кнопка-действие (например «Дать всё»).</summary>
-    private static void DrawActionButton(PixelCanvas canvas, MenuLayout.MenuItemGeom geometry,
-        MenuEntry entry, bool selected, bool hovered, int scale,
-        Texture? normalFill, Texture? hoverFill)
-    {
-        int s = scale;
-        string text = entry.Label.ToUpperInvariant();
-        int buttonWidth = PixelFont.Measure(text) + 12;
-        int contentWidth = geometry.ContentRight - geometry.ContentLeft;
-        int x = geometry.ContentLeft + Math.Max(0, (contentWidth - buttonWidth) / 2);
-        int y = geometry.BarTop;
-        int textX = (x + 6) * s;
-        int textY = (y + 1) * s;
-
-        if (selected || hovered)
-        {
-            canvas.Rect(x * s, y * s, buttonWidth * s, BarHeight * s, SelectedBackground);
-            canvas.Text(textX, textY, text, SelectedForeground, s);
-        }
-        else
-        {
-            canvas.FrameRect(x * s, y * s, buttonWidth * s, BarHeight * s, TitleColor);
-
-            if (hoverFill is not null)
-                canvas.TextFilled(textX, textY, text, hoverFill, TitleColor, s);
-            else if (normalFill is not null)
-                canvas.TextFilled(textX, textY, text, normalFill, TitleColor, s);
-            else
-                canvas.Text(textX, textY, text, TitleColor, s);
-        }
-    }
-
-    /// <summary>Закреплённая кнопка «Применить»: рамка золотом, под курсором — заливка.</summary>
-    private static void DrawApplyButton(PixelCanvas canvas, MenuLayout.MenuItemGeom geometry,
-        bool hovered, int scale)
-    {
-        int s = scale;
-        const string text = "ПРИМЕНИТЬ";
-        int buttonWidth = PixelFont.Measure(text) + 12;
-        int contentWidth = geometry.ContentRight - geometry.ContentLeft;
-        int x = geometry.ContentLeft + Math.Max(0, (contentWidth - buttonWidth) / 2);
-        int y = geometry.BarTop;
-        int textX = (x + 6) * s;
-        int textY = (y + 1) * s;
-
-        if (hovered)
-        {
-            canvas.Rect(x * s, y * s, buttonWidth * s, BarHeight * s, SelectedBackground);
-            canvas.Text(textX, textY, text, SelectedForeground, s);
-        }
-        else
-        {
-            canvas.FrameRect(x * s, y * s, buttonWidth * s, BarHeight * s, TitleColor);
-            canvas.Text(textX, textY, text, TitleColor, s);
-        }
-    }
-
-    /// <summary>Ползунок: дорожка, заполнение, ручка и числовое значение справа.</summary>
-    private static void DrawSlider(PixelCanvas canvas, MenuLayout.MenuItemGeom geometry, MenuEntry entry,
-        int controlTop, int scale)
-    {
-        int s = scale;
         int trackLeft = geometry.ContentLeft + 2;
         int trackY = controlTop + 2;
-        int valueWidth = PixelFont.Measure(entry.Value);
-        int valueX = geometry.ContentRight - valueWidth;
-
-        canvas.Rect(trackLeft * s, trackY * s, TrackWidth * s, 3 * s, SliderTrack);
-
         int filled = (int)Math.Round(entry.Fraction * (TrackWidth - 1));
-        canvas.Rect(trackLeft * s, trackY * s, (filled + 1) * s, 3 * s, SliderFill);
 
-        int knobX = trackLeft + filled - 2;
-        canvas.Rect(knobX * s, controlTop * s, 5 * s, 7 * s, KnobColor);
-        canvas.FrameRect(knobX * s, controlTop * s, 5 * s, 7 * s, KnobBorder);
+        Texture? track = assets?.GetUi("slider_track");
+        Texture? fill = assets?.GetUi("slider_fill");
+        Texture? knob = assets?.GetUi("slider_knob");
 
-        canvas.Text(valueX * s, controlTop * s, entry.Value, ValueColor, s);
+        if (track is not null && fill is not null && knob is not null)
+        {
+            canvas.Tile(track, 0, 0, track.Width, track.Height, trackLeft * scale, trackY * scale, TrackWidth * scale, track.Height * scale, scale);
+            canvas.Tile(fill, 0, 0, fill.Width, fill.Height, trackLeft * scale, (trackY + 1) * scale, (filled + 1) * scale, fill.Height * scale, scale);
+            canvas.Image(knob, (trackLeft + filled - knob.Width / 2) * scale, (controlTop - 0) * scale, scale);
+        }
+        else
+        {
+            canvas.Rect(trackLeft * scale, trackY * scale, TrackWidth * scale, 3 * scale, 0x2A3550);
+            canvas.Rect(trackLeft * scale, trackY * scale, (filled + 1) * scale, 3 * scale, 0x3AD2FF);
+        }
+
+        int valueWidth = text.Measure(entry.Value);
+        text.Draw(canvas, (geometry.ContentRight - valueWidth) * scale, controlTop * scale, entry.Value, "fill_value", ValueColor, scale);
 
         geometry.TrackLeft = trackLeft;
         geometry.TrackRight = trackLeft + TrackWidth;
     }
 
-    /// <summary>Список опций: «◄ значение ►» со стрелками по краям.</summary>
-    private static void DrawOption(PixelCanvas canvas, MenuLayout.MenuItemGeom geometry, MenuEntry entry,
-        int controlTop, bool hovered, int scale)
+    /// <summary>Список опций: «◄ значение ►».</summary>
+    private static void DrawOption(PixelCanvas canvas, MenuText text, MenuLayout.MenuItemGeom geometry, MenuEntry entry,
+        int controlTop, int scale)
     {
-        int s = scale;
-        string value = entry.Value.ToUpperInvariant();
-
         int arrowLeftX = geometry.ContentLeft + 2;
-        int arrowRightX = geometry.ContentRight - 7;
-        int arrowColor = hovered ? HoverForeground : BorderColor;
+        int arrowRightX = geometry.ContentRight - 10;
+        text.Draw(canvas, arrowLeftX * scale, controlTop * scale, "◄", "fill_normal", TitleColor, scale);
+        text.Draw(canvas, arrowRightX * scale, controlTop * scale, "►", "fill_normal", TitleColor, scale);
 
-        canvas.Text(arrowLeftX * s, controlTop * s, "◄", arrowColor, s);
-        canvas.Text(arrowRightX * s, controlTop * s, "►", arrowColor, s);
+        int valueWidth = text.Measure(entry.Value);
+        int betweenLeft = arrowLeftX + 12, betweenRight = arrowRightX - 3;
+        text.Draw(canvas, (betweenLeft + Math.Max(0, (betweenRight - betweenLeft - valueWidth) / 2)) * scale, controlTop * scale,
+            entry.Value, "fill_value", ValueColor, scale);
 
-        int betweenLeft = arrowLeftX + 8;
-        int betweenRight = arrowRightX - 4;
-        int valueWidth = PixelFont.Measure(value);
-        int valueX = betweenLeft + Math.Max(0, (betweenRight - betweenLeft - valueWidth) / 2);
-        canvas.Text(valueX * s, controlTop * s, value, ValueColor, s);
-
-        geometry.ArrowLeft = arrowLeftX + 2;
+        geometry.ArrowLeft = arrowLeftX + 6;
         geometry.ArrowRight = arrowRightX + 2;
     }
 
-    /// <summary>Переключатель: квадрат с галочкой и подпись состояния справа.</summary>
-    private static void DrawToggle(PixelCanvas canvas, MenuLayout.MenuItemGeom geometry, MenuEntry entry,
-        int controlTop, int scale)
+    /// <summary>Переключатель: гнездо с горящей галочкой и подпись состояния.</summary>
+    private static void DrawToggle(PixelCanvas canvas, AssetStore? assets, MenuText text, MenuLayout.MenuItemGeom geometry,
+        MenuEntry entry, int controlTop, int scale)
     {
-        int s = scale;
         int boxX = geometry.ContentLeft + 2;
-
-        if (entry.Fraction >= 0.5)
-        {
-            canvas.Rect(boxX * s, controlTop * s, 7 * s, 7 * s, SelectedBackground);
-            canvas.Text((boxX + 1) * s, controlTop * s, "✓", SelectedForeground, s);
-        }
+        Texture? box = assets?.GetUi(entry.Fraction >= 0.5 ? "check_on" : "check_off");
+        if (box is not null)
+            canvas.Image(box, boxX * scale, controlTop * scale, scale);
         else
-        {
-            canvas.FrameRect(boxX * s, controlTop * s, 7 * s, 7 * s, BoxOffColor);
-        }
+            canvas.FrameRect(boxX * scale, controlTop * scale, 9 * scale, 9 * scale, entry.Fraction >= 0.5 ? TitleColor : BorderColor);
 
-        canvas.Text((geometry.ContentRight - PixelFont.Measure(entry.Value)) * s, controlTop * s,
-            entry.Value, ValueColor, s);
+        int valueWidth = text.Measure(entry.Value);
+        text.Draw(canvas, (geometry.ContentRight - valueWidth) * scale, controlTop * scale, entry.Value, "fill_value", ValueColor, scale);
 
         geometry.BoxLeft = boxX;
-        geometry.BoxRight = boxX + 7;
+        geometry.BoxRight = boxX + 11;
     }
 
-    /// <summary>Стрелки прокрутки, если пункты не поместились целиком.</summary>
-    private static void DrawScrollIndicators(PixelCanvas canvas, int panelLeft, int panelWidth,
-        int contentTop, int first, int maxVisible, int total, int step, int scale)
+    /// <summary>Отметки прокрутки, если пункты не поместились.</summary>
+    private static void DrawScrollMarks(PixelCanvas canvas, int panelLeft, int panelWidth, int contentTop, int first,
+        int maxVisible, int total, int step, int scale)
     {
-        int s = scale;
-        int x = panelLeft + panelWidth - 8;
-
+        int x = panelLeft + panelWidth - PanelBorder - 6;
         if (first > 0)
-        {
-            int y = contentTop - 3;
-            canvas.Pixel((x + 2) * s, y * s, ScrollColor);
-
-            for (int dx = 1; dx <= 3; dx++)
-                canvas.Pixel((x + dx) * s, (y + 1) * s, ScrollColor);
-
-            for (int dx = 0; dx < 5; dx++)
-                canvas.Pixel((x + dx) * s, (y + 2) * s, ScrollColor);
-        }
-
+            canvas.Rect(x * scale, (contentTop - 3) * scale, 5 * scale, 1 * scale, TitleColor);
         if (first + maxVisible < total)
-        {
-            int y = contentTop + maxVisible * step + 1;
-
-            for (int dx = 0; dx < 5; dx++)
-                canvas.Pixel((x + dx) * s, y * s, ScrollColor);
-
-            for (int dx = 1; dx <= 3; dx++)
-                canvas.Pixel((x + dx) * s, (y + 1) * s, ScrollColor);
-
-            canvas.Pixel((x + 2) * s, (y + 2) * s, ScrollColor);
-        }
+            canvas.Rect(x * scale, (contentTop + maxVisible * step) * scale, 5 * scale, 1 * scale, TitleColor);
     }
 
-    /// <summary>Полоса подсказки по управлению внизу экрана.</summary>
-    private static void DrawHint(PixelCanvas canvas, string hint, int areaWidth, int areaHeight, int scale)
+    /// <summary>Подсказка по управлению внизу экрана (масштаб 1 — мелко и не мешает).</summary>
+    private static void DrawHint(PixelCanvas canvas, MenuText text, string hint)
     {
-        int s = scale;
-        string text = hint.ToUpperInvariant();
-        int barHeight = BarHeight + 2;
-        int y = Math.Max(0, areaHeight - barHeight - 1);
+        int height = text.LineHeight + 2;
+        int y = canvas.Height - height;
+        canvas.Rect(0, y, canvas.Width, height, HintBackground);
 
-        canvas.Rect(0, y * s, canvas.Width, barHeight * s, HintBackground);
+        // Узкое окно: подсказка из частей «…   …» теряет первые части, «Esc …» остаётся.
+        var parts = new List<string>(hint.Split("   ", StringSplitOptions.RemoveEmptyEntries));
+        while (parts.Count > 1 && text.Measure(string.Join("   ", parts)) > canvas.Width - 4)
+            parts.RemoveAt(0);
 
-        int x = Math.Max(2, (areaWidth - PixelFont.Measure(text)) / 2);
-        canvas.Text(x * s, (y + 1) * s, text, HintColor, s);
+        hint = string.Join("   ", parts);
+        int width = text.Measure(hint);
+        text.Draw(canvas, Math.Max(2, (canvas.Width - width) / 2), y + 1, hint, "fill_dim", HintColor, 1);
+    }
+
+    /// <summary>Текст меню: растровый шрифт с заливкой, а без картинок — встроенный пиксельный.</summary>
+    private sealed class MenuText(BitmapFont? font, AssetStore? assets)
+    {
+        public int LineHeight => font?.Height ?? 9;
+
+        public int Measure(string text) => font?.Measure(text) ?? PixelFont.Measure(text.ToUpperInvariant());
+
+        public void Draw(PixelCanvas canvas, int x, int y, string text, string fillName, int fallbackColor, int scale)
+        {
+            Texture? fill = assets?.GetUi(fillName);
+            if (font is not null && fill is not null)
+                font.Draw(canvas, x, y, text, fill, scale);
+            else
+                canvas.Text(x, y, text.ToUpperInvariant(), fallbackColor, scale);
+        }
     }
 }

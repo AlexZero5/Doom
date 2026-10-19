@@ -34,8 +34,8 @@ internal enum MenuEntryId
     /// <summary>Выйти из игры.</summary>
     Quit,
 
-    /// <summary>Качество графики (список опций).</summary>
-    Quality,
+    /// <summary>Разрешение трёхмерного вида (список опций).</summary>
+    Resolution,
 
     /// <summary>Чувствительность мыши (ползунок).</summary>
     MouseSensitivity,
@@ -63,6 +63,15 @@ internal enum MenuEntryId
 
     /// <summary>Разворачивать окно консоли при старте (переключатель).</summary>
     MaximizeWindow,
+
+    /// <summary>Прицел (переключатель).</summary>
+    Crosshair,
+
+    /// <summary>Прятать курсор в игре (переключатель).</summary>
+    HideCursor,
+
+    /// <summary>Сильнее упрощать кадр в движении (переключатель).</summary>
+    StrongMotion,
 
     /// <summary>Кнопка «Применить»: сохранить настройки сейчас.</summary>
     Apply,

@@ -5,494 +5,197 @@ using Doom.Gameplay;
 namespace Doom.Rendering;
 
 /// <summary>
-///     Отрисовка оружия от первого лица: покачивание при ходьбе, отдача, подъём ствола
-///     после смены и вспышка выстрела. Если в assets/weapons/ есть PNG для ствола
-///     (pistol.png, shotgun.png…), рисуется текстура; иначе — процедурная графика.
-///     Вспышка у дула тоже может быть анимацией из assets/anims/muzzle/.
+///     Оружие от первого лица: кадры из assets/weapons/&lt;ствол&gt;/ (их рисует tools/AssetForge).
+///     У каждого ствола своя анимация выстрела (<see cref="WeaponAnimations" />): кулак бьёт
+///     поочерёдно правой и левой, пила пилит, у дробовика передёргивается цевьё, у пулемёта
+///     вращается блок стволов. Покачивание — только при ходьбе; при смене ствол поднимается снизу.
 /// </summary>
-internal static class WeaponRenderer
+/// <remarks>
+///     Кадр — нижняя середина экрана Doom 640×400: 400 его пикселей по вертикали = высота вида.
+///     «Пиксель» кадра квадратный: по горизонтали — ячейка, по вертикали — половина ячейки.
+/// </remarks>
+internal sealed class WeaponRenderer(AssetStore? assets)
 {
-    private const double ScaleBaseRows = 30.0;
-    private const double BobSpeed = 4.5;
-    private const double BobAmplitude = 2.0;
+    private const double ScreenHeight = 400.0;
+    private const double BobSpeed = 7.0;
+    private const double BobAmplitudeX = 9.0;
+    private const double BobAmplitudeY = 6.0;
+    private const double RaiseDistance = 150.0;
 
-    public static void Draw(
-        Framebuffer framebuffer, Viewport viewport, Player player, double nowSeconds, AssetStore? assets = null)
+    public void Draw(Framebuffer framebuffer, Viewport viewport, Player player, double nowSeconds)
     {
-        double scale = Math.Max(1.0, viewport.Rows / ScaleBaseRows);
-        WeaponInfo info = WeaponCatalog.Get(player.CurrentWeapon);
-
-        // Оружие прижато к низу: по вертикали анимируются отдача и подъём после смены.
-        // Наклон взгляда утапливает ствол вниз (взгляд вверх) или поднимает (взгляд вниз),
-        // но не сильнее трети экрана, чтобы ствол не уезжал за кадр на предельном наклоне.
-        int bottom = viewport.Rows - 2;
-        double pitchShift = viewport.HorizonPixels(player.Pitch) - viewport.PixelRows * 0.5;
-        double pitchOffsetClamped = Math.Clamp(pitchShift * 0.2, -viewport.Rows * 0.35, viewport.Rows * 0.35);
-        int pitchOffset = (int)Math.Round(pitchOffsetClamped);
-        int bobX = (int)Math.Round(
-            Math.Sin(player.WeaponBobTime * BobSpeed) * BobAmplitude * scale * player.BobIntensity);
-
-        int recoil = Recoil(info, player, nowSeconds, scale);
-        int raise = (int)Math.Round((1.0 - player.RaiseProgress(nowSeconds)) * GameConfig.WeaponRaiseOffset * scale);
-        bool muzzleFlash = nowSeconds < player.MuzzleFlashUntil;
-        double fireProgress = FireProgress(info, player, nowSeconds);
-        double thrust = Math.Sin(Math.PI * fireProgress);
-
-        int centerX = viewport.Columns / 2 + bobX;
-        int baseY = bottom + recoil + raise + pitchOffset;
-
-        // Текстурный путь: PNG ствола из assets/weapons/<имя>.png.
-        Texture? weaponTexture = assets?.GetWeapon(WeaponFile(player.CurrentWeapon));
-        if (weaponTexture is not null)
-        {
-            int weaponTopPixel = DrawSprite(
-                framebuffer, viewport, weaponTexture, centerX,
-                GameConfig.WeaponTextureHeightFraction, bottomAnchorPixels: (baseY + 1) * 2);
-
-            Texture? flashFrame = assets?.GetAnimation("muzzle")
-                ?.Sample(nowSeconds - player.LastFireTime);
-
-            if (muzzleFlash && flashFrame is not null)
-            {
-                // Вспышка сидит у верха ствола, слегка перекрывая его.
-                DrawSprite(framebuffer, viewport, flashFrame, centerX,
-                    GameConfig.MuzzleAnimationHeightFraction,
-                    bottomAnchorPixels: weaponTopPixel + (int)(viewport.PixelRows
-                        * GameConfig.MuzzleAnimationHeightFraction) / 3);
-            }
-
+        if (assets is null)
             return;
-        }
 
-        switch (player.CurrentWeapon)
-        {
-            case WeaponKind.Fist:
-                DrawFist(framebuffer, viewport, player, centerX, baseY, thrust, scale);
-                break;
-            case WeaponKind.Chainsaw:
-                DrawChainsaw(framebuffer, viewport, player, centerX, baseY, thrust, scale);
-                break;
-            case WeaponKind.Pistol:
-                DrawPistol(framebuffer, viewport, centerX, baseY, muzzleFlash, scale);
-                break;
-            case WeaponKind.Shotgun:
-                DrawShotgun(framebuffer, viewport, centerX, baseY, muzzleFlash, scale);
-                break;
-            case WeaponKind.Chaingun:
-                DrawChaingun(framebuffer, viewport, player, centerX, baseY, muzzleFlash, scale);
-                break;
-            case WeaponKind.RocketLauncher:
-                DrawRocketLauncher(framebuffer, viewport, centerX, baseY, muzzleFlash, scale);
-                break;
-            case WeaponKind.PlasmaRifle:
-                DrawPlasmaRifle(framebuffer, viewport, player, centerX, baseY, muzzleFlash, nowSeconds, scale);
-                break;
-            case WeaponKind.Bfg9000:
-                DrawBfg(framebuffer, viewport, centerX, baseY, muzzleFlash, fireProgress, scale);
-                break;
-        }
+        WeaponAnimation animation = WeaponAnimations.Get(player.CurrentWeapon);
+        (string frameName, bool mirrored) = animation.FrameAt(player, nowSeconds);
+        Texture? frame = assets.GetWeaponFrame(animation.Folder, frameName)
+                         ?? assets.GetWeaponFrame(animation.Folder, animation.Idle);
+        if (frame is null)
+            return;
+
+        double scale = viewport.PixelRows / ScreenHeight;
+        double bobPhase = player.WeaponBobTime * BobSpeed;
+        double bobX = Math.Sin(bobPhase) * BobAmplitudeX * scale * player.BobIntensity;
+        double bobY = Math.Abs(Math.Cos(bobPhase)) * BobAmplitudeY * scale * player.BobIntensity;
+        double raise = (1.0 - player.RaiseProgress(nowSeconds)) * RaiseDistance * scale;
+
+        // Ствол всегда стоит на нижнем крае вида: наклон взгляда его не двигает (раньше он
+        // отрывался от низа экрана при взгляде вниз и уходил под HUD при взгляде вверх).
+        DrawFrame(framebuffer, viewport, frame, scale, viewport.Columns * 0.5 + bobX,
+            viewport.PixelRows + bobY + raise, mirrored);
     }
 
-    /// <summary>Имя PNG-файла ствола в assets/weapons/.</summary>
-    private static string WeaponFile(WeaponKind kind) => kind switch
+    /// <summary>Рисует кадр с масштабом: низ кадра на <paramref name="bottom" />, центр — <paramref name="centerX" />.</summary>
+    private static void DrawFrame(Framebuffer framebuffer, Viewport viewport, Texture frame, double scale,
+        double centerX, double bottom, bool mirrored)
     {
-        WeaponKind.Fist => "fist",
-        WeaponKind.Chainsaw => "chainsaw",
-        WeaponKind.Pistol => "pistol",
-        WeaponKind.Shotgun => "shotgun",
-        WeaponKind.Chaingun => "chaingun",
-        WeaponKind.RocketLauncher => "rocketlauncher",
-        WeaponKind.PlasmaRifle => "plasmarifle",
-        WeaponKind.Bfg9000 => "bfg9000",
-        _ => "pistol"
-    };
+        double width = frame.Width * scale;
+        double height = frame.Height * scale;
+        double left = centerX - width * 0.5;
+        double top = bottom - height;
 
-    /// <summary>
-    ///     Рисует текстуру спрайтом: высота задана долей кадра, ширина — по пропорциям,
-    ///     прозрачные пиксели не трогают фон. Возвращает верхний «пиксель» спрайта.
-    /// </summary>
-    private static int DrawSprite(
-        Framebuffer framebuffer, Viewport viewport, Texture texture,
-        int centerCellX, double heightFraction, int bottomAnchorPixels)
-    {
-        int heightPixels = (int)(viewport.PixelRows * heightFraction);
-        if (heightPixels < 2)
-            return bottomAnchorPixels;
+        int firstPixel = Math.Max(0, (int)Math.Floor(top));
+        int lastPixel = Math.Min(viewport.PixelRows - 1, (int)Math.Ceiling(bottom) - 1);
+        int firstColumn = Math.Max(0, (int)Math.Floor(left));
+        int lastColumn = Math.Min(viewport.Columns - 1, (int)Math.Ceiling(left + width) - 1);
+        double inverseScale = 1.0 / scale;
 
-        int widthPixels = Math.Max(1, (int)Math.Round((double)heightPixels * texture.Width / texture.Height));
-        int leftPixel = centerCellX * 2 - widthPixels / 2;
-        int topPixel = bottomAnchorPixels - heightPixels;
-
-        int drawTop = Math.Max(0, topPixel);
-        int drawBottom = Math.Min(viewport.PixelRows, bottomAnchorPixels);
-        int drawLeft = Math.Max(0, leftPixel);
-        int drawRight = Math.Min(framebuffer.Columns * 2, leftPixel + widthPixels);
-
-        for (int pixelY = drawTop; pixelY < drawBottom; pixelY++)
+        for (int pixel = firstPixel; pixel <= lastPixel; pixel++)
         {
-            int sourceY = (pixelY - topPixel) * texture.Height / heightPixels;
-            sourceY = Math.Clamp(sourceY, 0, texture.Height - 1);
+            int sourceY = (int)((pixel + 0.5 - top) * inverseScale);
+            if (sourceY < 0 || sourceY >= frame.Height)
+                continue;
 
-            int cellY = pixelY >> 1;
-            if (cellY >= framebuffer.Rows - 1)
-                break; // последняя строка — строка состояния
+            int rowBase = (pixel >> 1) * framebuffer.Columns;
+            int[] target = (pixel & 1) == 0 ? framebuffer.Foreground : framebuffer.Background;
 
-            bool isTopHalf = (pixelY & 1) == 0;
-            int rowBase = cellY * framebuffer.Columns;
-
-            for (int pixelX = drawLeft; pixelX < drawRight; pixelX++)
+            for (int column = firstColumn; column <= lastColumn; column++)
             {
-                int sourceX = (pixelX - leftPixel) * texture.Width / widthPixels;
-                sourceX = Math.Clamp(sourceX, 0, texture.Width - 1);
+                int sourceX = (int)((column + 0.5 - left) * inverseScale);
+                if (sourceX < 0 || sourceX >= frame.Width)
+                    continue;
+                if (mirrored)
+                    sourceX = frame.Width - 1 - sourceX;
 
-                int argb = texture.SamplePixel(sourceX, sourceY);
+                int argb = frame.SamplePixel(sourceX, sourceY);
                 if (Texture.IsTransparent(argb))
                     continue;
 
-                int cellX = pixelX >> 1;
-                if (cellX >= framebuffer.Columns)
-                    continue;
+                target[rowBase + column] = argb & 0xFFFFFF;
+                framebuffer.Chars[rowBase + column] = Framebuffer.UpperHalfBlock;
+            }
+        }
+    }
+}
 
-                int index = rowBase + cellX;
-                int color = Texture.RgbOf(argb);
+/// <summary>Анимация ствола: кадр покоя, последовательность выстрела и особые правила.</summary>
+internal sealed class WeaponAnimation
+{
+    public required string Folder { get; init; }
 
-                if (isTopHalf)
-                    framebuffer.Foreground[index] = color;
-                else
-                    framebuffer.Background[index] = color;
+    public string Idle { get; init; } = "idle";
 
-                framebuffer.Chars[index] = Framebuffer.UpperHalfBlock;
+    /// <summary>Кадры покоя по кругу (бензопила тарахтит), иначе — один кадр <see cref="Idle" />.</summary>
+    public (string Frame, double Seconds)[] IdleLoop { get; init; } = Array.Empty<(string, double)>();
+
+    /// <summary>Кадры после выстрела по порядку (время каждого, сек).</summary>
+    public (string Frame, double Seconds)[] Fire { get; init; } = Array.Empty<(string, double)>();
+
+    /// <summary>Чередовать кадры выстрела по номеру выстрела (пулемёт: блок стволов вращается).</summary>
+    public bool AlternateByShot { get; init; }
+
+    /// <summary>Каждый второй удар — зеркально (кулак: левой и правой).</summary>
+    public bool MirrorAlternate { get; init; }
+
+    public (string Frame, bool Mirrored) FrameAt(Player player, double now)
+    {
+        double sinceFire = now - player.LastFireTime;
+        bool mirrored = MirrorAlternate && !player.SwingFromLeft;
+
+        if (Fire.Length > 0 && sinceFire >= 0)
+        {
+            if (AlternateByShot)
+            {
+                double total = Fire.Sum(step => step.Seconds);
+                if (sinceFire < total)
+                    return (Fire[player.ShotsFired % Fire.Length].Frame, mirrored);
+            }
+            else
+            {
+                double elapsed = 0;
+                foreach ((string frame, double seconds) in Fire)
+                {
+                    elapsed += seconds;
+                    if (sinceFire < elapsed)
+                        return (frame, mirrored);
+                }
             }
         }
 
-        return topPixel;
-    }
-
-    /// <summary>Отдача: ствол на мгновение уходит вниз, затем возвращается на место.</summary>
-    private static int Recoil(WeaponInfo info, Player player, double nowSeconds, double scale)
-    {
-        double sinceFire = nowSeconds - player.LastFireTime;
-        if (sinceFire < 0 || sinceFire >= GameConfig.RecoilSeconds || info.Recoil <= 0)
-            return 0;
-
-        double k = 1.0 - sinceFire / GameConfig.RecoilSeconds;
-        return -(int)Math.Round(k * info.Recoil * scale);
-    }
-
-    /// <summary>Прогресс анимации выстрела: 0 — сразу после выстрела, 1 — анимация закончилась.</summary>
-    private static double FireProgress(WeaponInfo info, Player player, double nowSeconds)
-    {
-        double sinceFire = nowSeconds - player.LastFireTime;
-        if (sinceFire < 0)
-            return 1.0;
-
-        double duration = Math.Min(info.Cooldown, GameConfig.WeaponAnimationSeconds);
-        return duration <= 0 ? 1.0 : Math.Min(1.0, sinceFire / duration);
-    }
-
-
-    private static void DrawPistol(
-        Framebuffer framebuffer, Viewport viewport, int centerX, int baseY, bool muzzleFlash, double scale)
-    {
-        int bodyWidth = Size(10, scale);
-        int bodyHeight = Size(8, scale);
-        int left = centerX - bodyWidth / 2;
-        int top = baseY - bodyHeight + 1;
-
-        // Корпус уходит за нижний край игровой области — оружие «прижато» к низу.
-        int extendedHeight = viewport.Rows - 1 - top;
-        if (extendedHeight > 0)
-            framebuffer.PaintRect(left, top, bodyWidth, extendedHeight, 0x3A3A42);
-
-        // Блик по центру — только в верхней части.
-        framebuffer.PaintRect(left + bodyWidth / 2 - Size(1, scale), top, Size(2, scale), bodyHeight, 0x6E6E7A);
-
-        // Ствол торчит сверху.
-        framebuffer.PaintRect(centerX - Size(1, scale), top - Size(2, scale), Size(2, scale), Size(2, scale), 0x222228);
-
-        if (!muzzleFlash)
-            return;
-
-        framebuffer.PaintRect(centerX - Size(2, scale), top - Size(4, scale), Size(4, scale), Size(2, scale), 0xFFF070);
-        framebuffer.PaintRect(centerX - Size(1, scale), top - Size(5, scale), Size(2, scale), Size(1, scale), 0xFFFFFF);
-    }
-
-    /// <summary>Кулак: попеременно бьёт слева и справа, в конце удара втягивается обратно.</summary>
-    private static void DrawFist(
-        Framebuffer framebuffer, Viewport viewport, Player player, int centerX, int baseY, double thrust, double scale)
-    {
-        int size = Size(9, scale);
-        int side = player.SwingFromLeft ? -1 : 1;
-        int outward = Size(7, scale);
-        int shift = (int)Math.Round(thrust * outward);
-
-        int left = centerX + side * (Size(5, scale) + outward - shift) - size / 2;
-        int top = baseY - size + 1 - (int)Math.Round(thrust * Size(4, scale));
-
-        int height = viewport.Rows - 1 - top;
-        if (height <= 0)
-            return;
-
-        framebuffer.PaintRect(left, top, size, height, WeaponPalette.Skin);
-        framebuffer.PaintRect(left, top, size, Size(2, scale), WeaponPalette.SkinShade);
-
-        // Тень по внешнему краю кулака и между костяшками.
-        int shadowLeft = side < 0 ? left : left + size - Size(2, scale);
-        framebuffer.PaintRect(shadowLeft, top, Size(2, scale), height, WeaponPalette.SkinShade);
-        framebuffer.PaintRect(left + size / 2, top + Size(2, scale), Size(1, scale), height, WeaponPalette.SkinShade);
-    }
-
-    /// <summary>Бензопила: оранжевый корпус сбоку и полотно с зубьями, дёргающимися при вращении.</summary>
-    private static void DrawChainsaw(
-        Framebuffer framebuffer, Viewport viewport, Player player, int centerX, int baseY, double thrust, double scale)
-    {
-        int bodyWidth = Size(15, scale);
-        int bodyHeight = Size(9, scale);
-        int left = centerX - Size(4, scale) - (int)Math.Round(thrust * Size(6, scale));
-        int top = baseY - bodyHeight + 1 - (int)Math.Round(thrust * Size(3, scale));
-
-        int height = viewport.Rows - 1 - top;
-        if (height <= 0)
-            return;
-
-        framebuffer.PaintRect(left, top, bodyWidth, height, WeaponPalette.SawBody);
-        framebuffer.PaintRect(left + Size(2, scale), top + Size(1, scale), bodyWidth - Size(4, scale), height,
-            WeaponPalette.SawGrip);
-        framebuffer.PaintRect(left, top, bodyWidth, Size(1, scale), WeaponPalette.SawTeeth);
-
-        // Полотно уходит вверх и к центру экрана.
-        int bladeWidth = Size(3, scale);
-        int bladeHeight = Size(13, scale);
-        int bladeLeft = left + bodyWidth - Size(2, scale);
-        int bladeTop = top - bladeHeight + Size(3, scale);
-
-        framebuffer.PaintRect(bladeLeft, bladeTop, bladeWidth, bladeHeight, WeaponPalette.SawBlade);
-
-        bool spinning = thrust > 0.02;
-
-        for (int index = 0; index < 4; index++)
+        if (IdleLoop.Length > 0)
         {
-            int toothY = bladeTop + Size(1, scale) + index * Size(3, scale);
-            if (spinning)
-                toothY += (int)Math.Round(Math.Sin(player.SpinPhase + index * 1.7) * scale * 0.8);
-
-            framebuffer.PaintRect(bladeLeft - Size(1, scale), toothY, Size(1, scale), Size(1, scale),
-                WeaponPalette.SawTeeth);
-            framebuffer.PaintRect(bladeLeft + bladeWidth, toothY + Size(1, scale), Size(1, scale), Size(1, scale),
-                WeaponPalette.SawTeeth);
-        }
-    }
-
-    private static void DrawShotgun(
-        Framebuffer framebuffer, Viewport viewport, int centerX, int baseY, bool muzzleFlash, double scale)
-    {
-        int bodyWidth = Size(22, scale);
-        int bodyHeight = Size(9, scale);
-        int left = centerX - bodyWidth / 2;
-        int top = baseY - bodyHeight + 1;
-
-        // Приклад шире и «деревянный».
-        int extendedHeight = viewport.Rows - 1 - top;
-        if (extendedHeight > 0)
-        {
-            framebuffer.PaintRect(left + Size(4, scale), top, bodyWidth - Size(8, scale), extendedHeight, 0x6A4526);
-            framebuffer.PaintRect(left + Size(2, scale), top + Size(2, scale), Size(2, scale), extendedHeight - Size(2, scale), 0x6A4526);
-            framebuffer.PaintRect(left + bodyWidth - Size(4, scale), top + Size(2, scale), Size(2, scale), extendedHeight - Size(2, scale), 0x6A4526);
+            double cycle = IdleLoop.Sum(step => step.Seconds);
+            double t = now % cycle;
+            foreach ((string frame, double seconds) in IdleLoop)
+            {
+                if (t < seconds)
+                    return (frame, false);
+                t -= seconds;
+            }
         }
 
-        // Два ствола.
-        framebuffer.PaintRect(left + Size(5, scale), top - Size(4, scale), bodyWidth - Size(10, scale), Size(4, scale), 0x222228);
-        framebuffer.PaintRect(centerX - Size(2, scale), top - Size(5, scale), Size(1, scale), Size(5, scale), 0x35353E);
-        framebuffer.PaintRect(centerX + Size(1, scale), top - Size(5, scale), Size(1, scale), Size(5, scale), 0x35353E);
-
-        if (!muzzleFlash)
-            return;
-
-        framebuffer.PaintRect(centerX - Size(5, scale), top - Size(8, scale), Size(4, scale), Size(3, scale), 0xFFD040);
-        framebuffer.PaintRect(centerX + Size(1, scale), top - Size(8, scale), Size(4, scale), Size(3, scale), 0xFFD040);
-        framebuffer.PaintRect(centerX - Size(6, scale), top - Size(9, scale), Size(12, scale), Size(1, scale), 0xFFFFFF);
+        return (Idle, false);
     }
+}
 
-    /// <summary>Пулемёт: блок из четырёх стволов, вращающихся после каждого выстрела.</summary>
-    private static void DrawChaingun(
-        Framebuffer framebuffer, Viewport viewport, Player player, int centerX, int baseY, bool muzzleFlash, double scale)
+/// <summary>Анимации всех стволов (кадры — в assets/weapons/&lt;Folder&gt;/).</summary>
+internal static class WeaponAnimations
+{
+    private static readonly WeaponAnimation[] Animations =
     {
-        int bodyWidth = Size(21, scale);
-        int bodyHeight = Size(9, scale);
-        int left = centerX - bodyWidth / 2;
-        int top = baseY - bodyHeight + 1;
-
-        int height = viewport.Rows - 1 - top;
-        if (height > 0)
+        new()
         {
-            framebuffer.PaintRect(left, top, bodyWidth, height, WeaponPalette.ChaingunBody);
-            framebuffer.PaintRect(left + Size(3, scale), top + Size(1, scale), bodyWidth - Size(6, scale), height,
-                WeaponPalette.ChaingunHousing);
-        }
-
-        // Колодка стволов и сами стволы по кругу.
-        int muzzleTop = top - Size(4, scale);
-        framebuffer.PaintRect(centerX - Size(6, scale), muzzleTop, Size(12, scale), Size(5, scale),
-            WeaponPalette.ChaingunMount);
-
-        int ring = Size(3, scale);
-
-        for (int barrel = 0; barrel < 4; barrel++)
+            Folder = "fist", MirrorAlternate = true,
+            Fire = new[] { ("punch1", 0.06), ("punch2", 0.12), ("punch3", 0.1), ("punch1", 0.06) }
+        },
+        new()
         {
-            double angle = player.SpinPhase + barrel * Math.PI / 2;
-            int offsetX = (int)Math.Round(Math.Cos(angle) * ring);
-            int offsetY = (int)Math.Round(Math.Sin(angle) * ring * 0.6);
-            int barrelX = centerX + offsetX - Size(1, scale);
-            int barrelY = muzzleTop + Size(2, scale) + offsetY;
-
-            framebuffer.PaintRect(barrelX, barrelY - Size(2, scale), Size(2, scale), Size(3, scale),
-                WeaponPalette.ChaingunBarrel);
-
-            if (muzzleFlash)
-                framebuffer.PaintRect(barrelX, barrelY - Size(3, scale), Size(2, scale), Size(1, scale),
-                    WeaponPalette.MuzzleChaingun);
-        }
-
-        framebuffer.PaintRect(centerX - Size(7, scale), muzzleTop + Size(5, scale), Size(14, scale), Size(1, scale),
-            WeaponPalette.ChaingunRing);
-
-        if (!muzzleFlash)
-            return;
-
-        framebuffer.PaintRect(centerX - Size(2, scale), muzzleTop - Size(1, scale), Size(4, scale), Size(2, scale),
-            WeaponPalette.MuzzleWarm);
-        framebuffer.PaintRect(centerX - Size(1, scale), muzzleTop - Size(2, scale), Size(2, scale), Size(1, scale),
-            WeaponPalette.MuzzleCore);
-    }
-
-    /// <summary>Ракетница: широкая труба, тёмное жерло и пламя при выстреле.</summary>
-    private static void DrawRocketLauncher(
-        Framebuffer framebuffer, Viewport viewport, int centerX, int baseY, bool muzzleFlash, double scale)
-    {
-        int bodyWidth = Size(19, scale);
-        int bodyHeight = Size(10, scale);
-        int left = centerX - bodyWidth / 2;
-        int top = baseY - bodyHeight + 1;
-
-        int height = viewport.Rows - 1 - top;
-        if (height > 0)
-            framebuffer.PaintRect(left, top, bodyWidth, height, WeaponPalette.RocketTube);
-
-        int tubeWidth = Size(11, scale);
-        int tubeHeight = Size(6, scale);
-        int tubeLeft = centerX - tubeWidth / 2;
-        int tubeTop = top - tubeHeight + Size(2, scale);
-
-        framebuffer.PaintRect(tubeLeft, tubeTop, tubeWidth, tubeHeight, WeaponPalette.RocketTube);
-        framebuffer.PaintRect(tubeLeft, tubeTop + tubeHeight - Size(1, scale), tubeWidth, Size(1, scale),
-            WeaponPalette.RocketDark);
-
-        // Прицел сверху, маркер готовности и тёмное отверстие жерла.
-        framebuffer.PaintRect(tubeLeft + Size(2, scale), tubeTop - Size(3, scale), Size(3, scale), Size(2, scale),
-            WeaponPalette.RocketDark);
-        framebuffer.PaintRect(tubeLeft + tubeWidth - Size(5, scale), tubeTop - Size(3, scale), Size(3, scale),
-            Size(2, scale), WeaponPalette.RocketSight);
-        framebuffer.PaintRect(tubeLeft + Size(2, scale), tubeTop + Size(2, scale), tubeWidth - Size(4, scale),
-            tubeHeight - Size(3, scale), WeaponPalette.RocketBore);
-
-        if (!muzzleFlash)
-            return;
-
-        framebuffer.PaintRect(tubeLeft + Size(1, scale), tubeTop - Size(7, scale), tubeWidth - Size(2, scale),
-            Size(4, scale), WeaponPalette.FlameOuter);
-        framebuffer.PaintRect(tubeLeft + Size(3, scale), tubeTop - Size(6, scale), tubeWidth - Size(6, scale),
-            Size(2, scale), WeaponPalette.FlameInner);
-    }
-
-    /// <summary>Плазменная винтовка: пульсирующее ядро и зелёная вспышка у дула.</summary>
-    private static void DrawPlasmaRifle(
-        Framebuffer framebuffer,
-        Viewport viewport,
-        Player player,
-        int centerX,
-        int baseY,
-        bool muzzleFlash,
-        double nowSeconds,
-        double scale)
-    {
-        int bodyWidth = Size(20, scale);
-        int bodyHeight = Size(9, scale);
-        int left = centerX - bodyWidth / 2;
-        int top = baseY - bodyHeight + 1;
-
-        int height = viewport.Rows - 1 - top;
-        if (height > 0)
+            Folder = "chainsaw", Idle = "idle1",
+            IdleLoop = new[] { ("idle1", 0.07), ("idle2", 0.07) },
+            Fire = new[] { ("saw1", 0.055), ("saw2", 0.055) }
+        },
+        new()
         {
-            framebuffer.PaintRect(left, top, bodyWidth, height, WeaponPalette.PlasmaBody);
-            framebuffer.PaintRect(left + Size(4, scale), top, bodyWidth - Size(8, scale), height,
-                WeaponPalette.PlasmaHousing);
-        }
-
-        // Ядро пульсирует в такт стрельбе, поэтому его размер зависит от времени.
-        double pulse = 0.6 + 0.4 * Math.Sin(nowSeconds * 9.0 + player.SpinPhase);
-        int coreWidth = Size(2, scale) + (int)Math.Round(pulse * Size(2, scale));
-        int coreTop = top - Size(3, scale);
-
-        framebuffer.PaintRect(centerX - coreWidth / 2 - Size(1, scale), coreTop - Size(1, scale),
-            coreWidth + Size(2, scale), Size(6, scale), WeaponPalette.PlasmaHousing);
-        framebuffer.PaintRect(centerX - coreWidth / 2, coreTop, coreWidth, Size(4, scale), WeaponPalette.PlasmaCore);
-
-        if (!muzzleFlash)
-            return;
-
-        framebuffer.PaintRect(centerX - Size(3, scale), coreTop - Size(3, scale), Size(6, scale), Size(3, scale),
-            WeaponPalette.PlasmaCore);
-        framebuffer.PaintRect(centerX - Size(1, scale), coreTop - Size(4, scale), Size(2, scale), Size(2, scale),
-            WeaponPalette.PlasmaGlow);
-    }
-
-    /// <summary>BFG9000: огромный раструб, который заряжается между выстрелами.</summary>
-    private static void DrawBfg(
-        Framebuffer framebuffer,
-        Viewport viewport,
-        int centerX,
-        int baseY,
-        bool muzzleFlash,
-        double fireProgress,
-        double scale)
-    {
-        int bodyWidth = Size(26, scale);
-        int bodyHeight = Size(10, scale);
-        int left = centerX - bodyWidth / 2;
-        int top = baseY - bodyHeight + 1;
-
-        int height = viewport.Rows - 1 - top;
-        if (height > 0)
+            Folder = "pistol",
+            Fire = new[] { ("fire1", 0.05), ("fire2", 0.06), ("fire3", 0.09) }
+        },
+        new()
         {
-            framebuffer.PaintRect(left, top, bodyWidth, height, WeaponPalette.BfgBody);
-            framebuffer.PaintRect(left + Size(5, scale), top, bodyWidth - Size(10, scale), height,
-                WeaponPalette.BfgHousing);
-        }
+            Folder = "shotgun",
+            Fire = new[] { ("fire1", 0.06), ("fire2", 0.08), ("idle", 0.12), ("pump1", 0.16), ("pump2", 0.14) }
+        },
+        new()
+        {
+            Folder = "chaingun", AlternateByShot = true,
+            Fire = new[] { ("fire1", GameConfig.TargetFrameMs / 1000.0 * 5), ("fire2", GameConfig.TargetFrameMs / 1000.0 * 5) }
+        },
+        new()
+        {
+            Folder = "rocketlauncher",
+            Fire = new[] { ("fire1", 0.06), ("fire2", 0.1), ("fire3", 0.16) }
+        },
+        new()
+        {
+            Folder = "plasmarifle",
+            Fire = new[] { ("fire1", 0.04), ("fire2", 0.05) }
+        },
+        new()
+        {
+            Folder = "bfg9000",
+            Fire = new[] { ("fire1", 0.1), ("fire2", 0.3), ("charge1", 0.4), ("charge2", 0.4) }
+        },
+    };
 
-        int muzzleWidth = Size(16, scale);
-        int muzzleHeight = Size(7, scale);
-        int muzzleLeft = centerX - muzzleWidth / 2;
-        int muzzleTop = top - muzzleHeight + Size(2, scale);
-
-        framebuffer.PaintRect(muzzleLeft, muzzleTop, muzzleWidth, muzzleHeight, WeaponPalette.BfgMuzzle);
-
-        // Ядро растёт по мере перезарядки — от выстрела до готовности.
-        int coreWidth = Size(4, scale) + (int)Math.Round(fireProgress * Size(6, scale));
-        int coreHeight = Size(2, scale) + (int)Math.Round(fireProgress * Size(3, scale));
-
-        framebuffer.PaintRect(centerX - coreWidth / 2, muzzleTop + (muzzleHeight - coreHeight) / 2, coreWidth,
-            coreHeight, WeaponPalette.BfgCore);
-
-        if (!muzzleFlash)
-            return;
-
-        framebuffer.PaintRect(muzzleLeft - Size(2, scale), muzzleTop - Size(4, scale), muzzleWidth + Size(4, scale),
-            Size(4, scale), WeaponPalette.BfgMuzzle);
-        framebuffer.PaintRect(centerX - Size(3, scale), muzzleTop - Size(5, scale), Size(6, scale), Size(3, scale),
-            WeaponPalette.BfgCore);
-    }
-
-    /// <summary>Масштабирует базовый размер под высоту кадра, минимум — 1 символ.</summary>
-    private static int Size(double baseSize, double scale) =>
-        Math.Max(1, (int)Math.Round(baseSize * scale));
+    public static WeaponAnimation Get(WeaponKind kind) => Animations[(int)kind];
 }

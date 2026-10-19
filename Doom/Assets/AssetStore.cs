@@ -1,76 +1,90 @@
+using System.Globalization;
 using System.Text.Json;
 using Doom.Configuration;
 
 namespace Doom.Assets;
 
 /// <summary>
-///     Хранилище ассетов. Папка assets/ (walls/, weapons/, sprites/, anims/) сканируется
-///     при старте; каждый PNG декодируется в текстуру и сбрасывается в бинарный кэш
-///     assets/.cache/*.tex — при следующем запуске кэш читается напрямую, без декодирования
-///     (инвалидация по времени и размеру исходника). Пока игра запущена, FileSystemWatcher
-///     следит за папкой: перекрасил PNG в редакторе — текстура в игре обновилась сама.
+///     Хранилище ассетов. Вся папка assets/ сканируется при старте: каждый PNG становится
+///     текстурой с ключом «путь без расширения» (<c>textures/brick_red</c>, <c>weapons/pistol/fire1</c>),
+///     папки anims/&lt;клип&gt;/ — анимациями. Декодированные PNG сбрасываются в бинарный кэш
+///     assets/.cache/ — при следующем запуске он читается напрямую. Пока игра запущена,
+///     FileSystemWatcher следит за папкой: перерисованный PNG подхватывается на лету.
 /// </summary>
+/// <remarks>Всю графику генерирует tools/AssetForge.</remarks>
 internal sealed class AssetStore : IDisposable
 {
     private const uint CacheMagic = 0x4658_5444; // "FDTX"
 
     private const int CacheHeaderSize = 4 + 1 + 4 + 4 + 8 + 8;
 
-    // Категории с плоским списком PNG (кроме anims — там папка = клип).
-    private static readonly string[] FlatCategories = { "walls", "weapons", "sprites", "fonts" };
-
     private readonly Dictionary<string, Texture> _textures = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly Dictionary<string, AnimationClip> _animations = new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly Dictionary<string, double> _spriteScale = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly object _pendingGate = new();
     private readonly Queue<string> _pendingChanges = new();
 
     private FileSystemWatcher? _watcher;
 
-    /// <summary>Абсолютный путь к корню ассетов (папка создаётся при отсутствии).</summary>
+    /// <summary>Абсолютный путь к корню ассетов.</summary>
     public string RootPath { get; private set; } = string.Empty;
 
-    /// <summary>Сколько текстур загружено (для диагностики).</summary>
-    public int TextureCount => _textures.Count;
-
-    /// <summary>Сколько анимационных клипов загружено.</summary>
-    public int AnimationCount => _animations.Count;
+    /// <summary>Растёт при каждой перезагрузке: по нему кэши рендера понимают, что пора обновиться.</summary>
+    public int Version { get; private set; }
 
     // ============================================================
-    //   Запросы из рендера
+    //   Запросы
     // ============================================================
 
-    /// <summary>Текстура стены по типу клетки: assets/walls/&lt;тип&gt;.png.</summary>
-    public Texture? GetWall(int tileType) => Get($"walls/{tileType}.png");
+    /// <summary>Текстура по ключу «путь без расширения» (например <c>textures/brick_red</c>).</summary>
+    public Texture? Get(string key) => _textures.GetValueOrDefault(key);
 
-    /// <summary>Текстура пола: тоже стены (6 — трава, 7 — металл, 8 — земля).</summary>
-    public Texture? GetFloor(int floorType) => Get($"walls/{floorType}.png");
+    /// <summary>Материал стены, пола, потолка или 3D-объекта: assets/textures/&lt;имя&gt;.png.</summary>
+    public Texture? GetTexture(string name) => Get("textures/" + name);
 
-    /// <summary>Скайбокс: 360° панорама в assets/walls/9.png (рисунок в верхней половине).</summary>
-    public Texture? GetSkybox() => Get("walls/9.png");
+    /// <summary>Небо: панорама assets/sky/&lt;имя&gt;.png (зенит сверху, горизонт снизу).</summary>
+    public Texture? GetSky(string name) => Get("sky/" + name);
 
-    /// <summary>Текстура оружия: assets/weapons/&lt;имя&gt;.png.</summary>
-    public Texture? GetWeapon(string name) => Get($"weapons/{name}.png");
+    /// <summary>Спрайт бонуса или декорации: assets/sprites/&lt;имя&gt;.png.</summary>
+    public Texture? GetSprite(string name) => Get("sprites/" + name);
 
-    /// <summary>Текстура спрайта: assets/sprites/&lt;имя&gt;.png.</summary>
-    public Texture? GetSprite(string name) => Get($"sprites/{name}.png");
+    /// <summary>Кадр оружия: assets/weapons/&lt;оружие&gt;/&lt;кадр&gt;.png.</summary>
+    public Texture? GetWeaponFrame(string weapon, string frame) => Get($"weapons/{weapon}/{frame}");
 
-    /// <summary>Текстурная заливка шрифта: assets/fonts/&lt;имя&gt;.png.</summary>
-    public Texture? GetFont(string name) => Get($"fonts/{name}.png");
+    /// <summary>Элемент интерфейса: assets/ui/&lt;имя&gt;.png.</summary>
+    public Texture? GetUi(string name) => Get("ui/" + name);
+
+    /// <summary>Элемент строки состояния: assets/hud/&lt;имя&gt;.png.</summary>
+    public Texture? GetHud(string name) => Get("hud/" + name);
 
     /// <summary>Анимационный клип: assets/anims/&lt;имя&gt;/.</summary>
-    public AnimationClip? GetAnimation(string name) =>
-        _animations.GetValueOrDefault(name.ToLowerInvariant());
+    public AnimationClip? GetAnimation(string name) => _animations.GetValueOrDefault(name);
 
-    private Texture? Get(string relativePath) =>
-        _textures.GetValueOrDefault(relativePath.Replace('\\', '/'));
+    /// <summary>Сколько пикселей спрайта приходится на единицу мира (из sprites/sprites.txt).</summary>
+    public double SpritePixelsPerUnit(string name) => _spriteScale.GetValueOrDefault(name, 32);
+
+    /// <summary>Текстовый файл из assets/ (описание шрифта, карты) или null.</summary>
+    public string? ReadText(string relativePath)
+    {
+        try
+        {
+            string path = Path.Combine(RootPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+            return File.Exists(path) ? File.ReadAllText(path) : null;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
 
     // ============================================================
     //   Жизненный цикл
     // ============================================================
 
-    /// <summary>Находит (или создаёт) папку ассетов, загружает всё и включает слежение.</summary>
+    /// <summary>Находит папку ассетов, загружает всё и включает слежение.</summary>
     public void Load()
     {
         ResolveRoot();
@@ -79,45 +93,44 @@ internal sealed class AssetStore : IDisposable
         WriteDiagnostics();
     }
 
-    /// <summary>
-    ///     Диагностика запуска: куда разрешился корень ассетов и что загрузилось.
-    ///     Пишется в консоль и в файл рядом с exe — по нему видно, почему игра
-    ///     вдруг рисует процедурщину вместо текстур.
-    /// </summary>
     private void WriteDiagnostics()
     {
-        Console.WriteLine(
-            $"[assets] root={RootPath} textures={_textures.Count} anims={_animations.Count}");
+        Console.WriteLine($"[assets] root={RootPath} textures={_textures.Count} anims={_animations.Count}");
 
         try
         {
-            string line =
-                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | cwd={Environment.CurrentDirectory} | " +
-                $"root={RootPath} | textures={_textures.Count} | anims={_animations.Count}{Environment.NewLine}";
-
-            File.AppendAllText(
-                Path.Combine(AppContext.BaseDirectory, "assets_last_run.log"), line);
+            File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "assets_last_run.log"),
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | cwd={Environment.CurrentDirectory} | root={RootPath} | " +
+                $"textures={_textures.Count} | anims={_animations.Count}{Environment.NewLine}");
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             // Лог не критичен.
         }
     }
 
-    /// <summary>Применяет накопившиеся изменения файлов (вызывать из главного цикла).</summary>
-    public void Poll()
+    /// <summary>
+    ///     Применяет накопившиеся изменения файлов (вызывать из главного цикла, не во время
+    ///     рендера). Возвращает <c>true</c>, если что-то перезагрузилось и кадр надо перерисовать.
+    /// </summary>
+    public bool Poll()
     {
+        string[] changes;
+
         lock (_pendingGate)
         {
             if (_pendingChanges.Count == 0)
-                return;
+                return false;
 
-            while (_pendingChanges.Count > 0)
-            {
-                string relativePath = _pendingChanges.Dequeue();
-                ReloadPath(relativePath);
-            }
+            changes = _pendingChanges.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            _pendingChanges.Clear();
         }
+
+        foreach (string relativePath in changes)
+            ReloadPath(relativePath);
+
+        Version++;
+        return true;
     }
 
     public void Dispose()
@@ -126,33 +139,21 @@ internal sealed class AssetStore : IDisposable
         _watcher = null;
     }
 
-    /// <summary>
-    ///     Ищет assets/ вверх по дереву от рабочего каталога и папки с exe.
-    ///     Найденный корень не мутируется: структура папок создаётся только когда
-    ///     настоящего корня нет и мы заводим новый рядом с рабочим каталогом
-    ///     (иначе однажды созданные пустые категории в чужой папке заставляют
-    ///     последующие запуски считать её корнем).
-    /// </summary>
+    /// <summary>Ищет assets/ вверх по дереву от рабочего каталога и папки с exe.</summary>
     private void ResolveRoot()
     {
-        string? root = FindUpwards(Directory.GetCurrentDirectory())
-                       ?? FindUpwards(AppContext.BaseDirectory);
+        RootPath = FindUpwards(Directory.GetCurrentDirectory())
+                   ?? FindUpwards(AppContext.BaseDirectory)
+                   ?? Path.Combine(Directory.GetCurrentDirectory(), GameConfig.AssetsFolderName);
 
-        if (root is not null)
+        try
         {
-            RootPath = root;
             Directory.CreateDirectory(CacheDirectory);
-            return;
         }
-
-        RootPath = Path.Combine(Directory.GetCurrentDirectory(), GameConfig.AssetsFolderName);
-        Directory.CreateDirectory(RootPath);
-
-        foreach (string category in FlatCategories)
-            Directory.CreateDirectory(Path.Combine(RootPath, category));
-
-        Directory.CreateDirectory(Path.Combine(RootPath, "anims"));
-        Directory.CreateDirectory(CacheDirectory);
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // Без кэша тоже работаем — просто декодируем PNG каждый раз.
+        }
     }
 
     private string CacheDirectory => Path.Combine(RootPath, GameConfig.AssetCacheFolderName);
@@ -163,10 +164,9 @@ internal sealed class AssetStore : IDisposable
         {
             string candidate = Path.Combine(start, GameConfig.AssetsFolderName);
 
-            // Папка должна быть ПОХОЖА на ассеты. Иначе мимо неё путь продолжается:
-            // случайный одноимённый каталог (например, Doom/Assets/ с кодом — Windows
-            // не различает регистр) не должен засчитаться и обнулить загрузку.
-            if (Directory.Exists(candidate) && LooksLikeAssetsRoot(candidate))
+            // Папка должна быть похожа на ассеты: одноимённый каталог с кодом (Doom/Assets —
+            // Windows не различает регистр) не должен засчитаться.
+            if (Directory.Exists(candidate) && Directory.Exists(Path.Combine(candidate, "textures")))
                 return candidate;
 
             start = Path.GetDirectoryName(start.TrimEnd(Path.DirectorySeparatorChar));
@@ -175,71 +175,56 @@ internal sealed class AssetStore : IDisposable
         return null;
     }
 
-    /// <summary>Правда ли в папке есть категории ассетов или хотя бы один PNG.</summary>
-    private static bool LooksLikeAssetsRoot(string path)
-    {
-        foreach (string category in new[] { "walls", "weapons", "sprites", "anims", "fonts" })
-        {
-            if (Directory.Exists(Path.Combine(path, category)))
-                return true;
-        }
-
-        try
-        {
-            return Directory.EnumerateFiles(path, "*.png", SearchOption.TopDirectoryOnly).Any();
-        }
-        catch (IOException)
-        {
-            return false;
-        }
-    }
-
     // ============================================================
     //   Загрузка
     // ============================================================
 
     private void Scan()
     {
-        foreach (string category in FlatCategories)
+        foreach (string file in SafeFiles(RootPath, "*.png", SearchOption.AllDirectories))
         {
-            string directory = Path.Combine(RootPath, category);
-            foreach (string file in SafeFiles(directory, "*.png"))
-                LoadTexture(ToRelative(file));
+            string relative = ToRelative(file);
+            if (!relative.StartsWith(GameConfig.AssetCacheFolderName + "/", StringComparison.OrdinalIgnoreCase))
+                LoadTexture(relative);
         }
 
-        string animsDirectory = Path.Combine(RootPath, "anims");
-        foreach (string directory in SafeDirectories(animsDirectory))
+        foreach (string directory in SafeDirectories(Path.Combine(RootPath, "anims")))
             BuildAnimation(Path.GetFileName(directory));
+
+        LoadSpriteScale();
     }
 
-    /// <summary>Декодирует (или берёт из кэша) один PNG и кладёт в словарь. false — файл битый.</summary>
+    /// <summary>Ключ текстуры: путь без расширения через «/».</summary>
+    private static string KeyOf(string relativePath) =>
+        Path.ChangeExtension(relativePath, null)!.Replace('\\', '/');
+
+    /// <summary>Декодирует (или берёт из кэша) один PNG. false — файл битый или пропал.</summary>
     private bool LoadTexture(string relativePath)
     {
         string fullPath = Path.Combine(RootPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        string key = KeyOf(relativePath);
 
         if (!File.Exists(fullPath))
         {
-            _textures.Remove(relativePath);
+            _textures.Remove(key);
             return false;
         }
 
         byte[] source;
-        long ticks, length;
+        long ticks;
 
         try
         {
             source = File.ReadAllBytes(fullPath);
             ticks = File.GetLastWriteTimeUtc(fullPath).Ticks;
-            length = source.Length;
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return false; // файл занят редактором — дождёмся следующего события
         }
 
-        // Кэш валиден, если совпадают magic, версия, размеры, время и длина исходника.
         string cachePath = CachePathFor(relativePath);
-        Texture? texture = TryReadCache(cachePath, ticks, length);
+        Texture? texture = TryReadCache(cachePath, ticks, source.Length);
 
         if (texture is null)
         {
@@ -250,15 +235,15 @@ internal sealed class AssetStore : IDisposable
             }
 
             texture = decoded!;
-            WriteCache(cachePath, texture, ticks, length);
+            WriteCache(cachePath, texture, ticks, source.Length);
         }
 
-        texture.Name = relativePath;
-        _textures[relativePath] = texture;
+        texture.Name = key;
+        _textures[key] = texture;
         return true;
     }
 
-    /// <summary>Собирает клип анимации из папки assets/anims/&lt;имя&gt;/.</summary>
+    /// <summary>Собирает клип анимации из папки assets/anims/&lt;имя&gt;/ (кадры 0.png, 1.png…).</summary>
     private void BuildAnimation(string clipName)
     {
         string directory = Path.Combine(RootPath, "anims", clipName);
@@ -269,16 +254,12 @@ internal sealed class AssetStore : IDisposable
             return;
         }
 
-        var frameFiles = SafeFiles(directory, "*.png")
-            .OrderBy(NaturalOrderKey)
-            .ToList();
-
         var frames = new List<Texture>();
-
-        foreach (string file in frameFiles)
+        foreach (string file in SafeFiles(directory, "*.png", SearchOption.TopDirectoryOnly).OrderBy(NaturalOrderKey))
         {
-            string relativePath = ToRelative(file);
-            if (LoadTexture(relativePath) && _textures.TryGetValue(relativePath, out Texture? texture))
+            string relative = ToRelative(file);
+            if (_textures.TryGetValue(KeyOf(relative), out Texture? texture) || LoadTexture(relative) &&
+                _textures.TryGetValue(KeyOf(relative), out texture))
                 frames.Add(texture);
         }
 
@@ -289,12 +270,11 @@ internal sealed class AssetStore : IDisposable
         }
 
         (double frameTime, bool loop) = ReadManifest(directory);
-        _animations[clipName.ToLowerInvariant()] =
-            new AnimationClip(clipName, frames.ToArray(), frameTime, loop);
+        _animations[clipName] = new AnimationClip(clipName, frames.ToArray(), frameTime, loop);
     }
 
     /// <summary>manifest.json рядом с кадрами: {"frameTime": 0.1, "loop": false}.</summary>
-    private static (double frameTime, bool loop) ReadManifest(string directory)
+    private static (double FrameTime, bool Loop) ReadManifest(string directory)
     {
         double frameTime = GameConfig.DefaultAnimationFrameTime;
         bool loop = true;
@@ -314,15 +294,31 @@ internal sealed class AssetStore : IDisposable
             if (root.TryGetProperty("loop", out JsonElement loopElement))
                 loop = loopElement.ValueKind == JsonValueKind.True;
         }
-        catch (JsonException)
+        catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException)
         {
-            // Битый манифест не должен валить загрузку — берутся значения по умолчанию.
+            // Битый манифест не валит загрузку — берутся значения по умолчанию.
         }
 
         return (frameTime, loop);
     }
 
-    // Ключ сортировки кадров: «2» < «10», а не «10» < «2» как при обычной сортировке строк.
+    /// <summary>sprites/sprites.txt: «имя пикселей_на_метр» — масштаб спрайтов в мире.</summary>
+    private void LoadSpriteScale()
+    {
+        _spriteScale.Clear();
+        string? text = ReadText("sprites/sprites.txt");
+        if (text is null)
+            return;
+
+        foreach (string line in text.Split('\n'))
+        {
+            string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (parts.Length == 2 && !parts[0].StartsWith('#')
+                                  && double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out double ppu) && ppu > 0)
+                _spriteScale[parts[0]] = ppu;
+        }
+    }
+
     private static string NaturalOrderKey(string path)
     {
         string name = Path.GetFileNameWithoutExtension(path);
@@ -333,16 +329,10 @@ internal sealed class AssetStore : IDisposable
     //   Бинарный кэш
     // ============================================================
 
-    private string CachePathFor(string relativePath)
-    {
-        string flat = relativePath
-            .Replace('/', '_')
-            .Replace('\\', '_');
+    private string CachePathFor(string relativePath) =>
+        Path.Combine(CacheDirectory, Path.ChangeExtension(relativePath.Replace('/', '_').Replace('\\', '_'), ".tex"));
 
-        return Path.Combine(CacheDirectory, Path.ChangeExtension(flat, ".tex"));
-    }
-
-    private Texture? TryReadCache(string cachePath, long ticks, long length)
+    private static Texture? TryReadCache(string cachePath, long ticks, long length)
     {
         try
         {
@@ -350,44 +340,29 @@ internal sealed class AssetStore : IDisposable
                 return null;
 
             byte[] data = File.ReadAllBytes(cachePath);
-            if (data.Length < CacheHeaderSize)
+            if (data.Length < CacheHeaderSize || BitConverter.ToUInt32(data, 0) != CacheMagic || data[4] != 1)
                 return null;
 
-            int offset = 0;
-            uint magic = BitConverter.ToUInt32(data, offset);
-            offset += 4;
+            int width = BitConverter.ToInt32(data, 5);
+            int height = BitConverter.ToInt32(data, 9);
+            long cacheTicks = BitConverter.ToInt64(data, 13);
+            long cacheLength = BitConverter.ToInt64(data, 21);
 
-            if (magic != CacheMagic || data[offset++] != 1)
+            if (cacheTicks != ticks || cacheLength != length || width < 1 || height < 1
+                || width > 8192 || height > 8192 || data.Length < CacheHeaderSize + (long)width * height * 4)
                 return null;
 
-            int width = BitConverter.ToInt32(data, offset);
-            offset += 4;
-            int height = BitConverter.ToInt32(data, offset);
-            offset += 4;
-            long cacheTicks = BitConverter.ToInt64(data, offset);
-            offset += 8;
-            long cacheLength = BitConverter.ToInt64(data, offset);
-            offset += 8;
-
-            if (cacheTicks != ticks || cacheLength != length)
-                return null;
-
-            int pixelCount = width * height;
-            if (width < 1 || height < 1 || data.Length < offset + pixelCount * 4)
-                return null;
-
-            var pixels = new int[pixelCount];
-            Buffer.BlockCopy(data, offset, pixels, 0, pixelCount * 4);
-
+            var pixels = new int[width * height];
+            Buffer.BlockCopy(data, CacheHeaderSize, pixels, 0, pixels.Length * 4);
             return new Texture(string.Empty, width, height, pixels);
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return null;
         }
     }
 
-    private void WriteCache(string cachePath, Texture texture, long ticks, long length)
+    private static void WriteCache(string cachePath, Texture texture, long ticks, long length)
     {
         try
         {
@@ -405,9 +380,9 @@ internal sealed class AssetStore : IDisposable
             Buffer.BlockCopy(texture.Pixels, 0, pixelBytes, 0, pixelBytes.Length);
             writer.Write(pixelBytes);
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            // Кэш не критичен: не записался — просто декодируем PNG при следующем запуске.
+            // Кэш не критичен: не записался — декодируем PNG в следующий раз.
         }
     }
 
@@ -426,83 +401,68 @@ internal sealed class AssetStore : IDisposable
                 NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.DirectoryName
             };
 
-            _watcher.Changed += OnWatcherEvent;
-            _watcher.Created += OnWatcherEvent;
-            _watcher.Deleted += OnWatcherEvent;
-            _watcher.Renamed += OnWatcherRenamed;
+            _watcher.Changed += (_, args) => EnqueueRelative(args.FullPath);
+            _watcher.Created += (_, args) => EnqueueRelative(args.FullPath);
+            _watcher.Deleted += (_, args) => EnqueueRelative(args.FullPath);
+            _watcher.Renamed += (_, args) =>
+            {
+                EnqueueRelative(args.OldFullPath);
+                EnqueueRelative(args.FullPath);
+            };
 
             _watcher.EnableRaisingEvents = true;
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or ArgumentException or UnauthorizedAccessException)
         {
-            // Слежение не заведётся (например, папка на сетевом диске) — игра работает без hot-reload.
+            // Слежение не завелось (сетевой диск и т.п.) — игра работает без горячей перезагрузки.
         }
-    }
-
-    private void OnWatcherEvent(object sender, FileSystemEventArgs args)
-    {
-        EnqueueRelative(args.FullPath);
-    }
-
-    private void OnWatcherRenamed(object sender, RenamedEventArgs args)
-    {
-        EnqueueRelative(args.OldFullPath);
-        EnqueueRelative(args.FullPath);
     }
 
     private void EnqueueRelative(string fullPath)
     {
-        try
-        {
-            string relativePath = Path.GetRelativePath(RootPath, fullPath).Replace('\\', '/');
-            lock (_pendingGate)
-                _pendingChanges.Enqueue(relativePath);
-        }
-        catch (ArgumentException)
-        {
-            // Путь вне корня ассетов (или временный файл редактора) — не интересно.
-        }
+        string relativePath = ToRelative(fullPath);
+        if (relativePath.StartsWith(GameConfig.AssetCacheFolderName, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        lock (_pendingGate)
+            _pendingChanges.Enqueue(relativePath);
     }
 
     private void ReloadPath(string relativePath)
     {
         string extension = Path.GetExtension(relativePath);
         bool isPng = extension.Equals(".png", StringComparison.OrdinalIgnoreCase);
-        bool isManifest = extension.Equals(".json", StringComparison.OrdinalIgnoreCase);
-
-        if (!isPng && !isManifest)
-            return;
-
-        // Изменение кадра или манифеста — пересобираем весь клип.
-        if (relativePath.StartsWith("anims/", StringComparison.OrdinalIgnoreCase))
-        {
-            string clip = relativePath.Split('/')[1];
-            if (!string.IsNullOrEmpty(clip) && !clip.Equals(GameConfig.AssetCacheFolderName, StringComparison.OrdinalIgnoreCase))
-                BuildAnimation(clip);
-            return;
-        }
 
         if (isPng)
             LoadTexture(relativePath);
+
+        if (relativePath.StartsWith("anims/", StringComparison.OrdinalIgnoreCase))
+        {
+            string[] parts = relativePath.Split('/');
+            if (parts.Length > 1 && parts[1].Length > 0)
+                BuildAnimation(parts[1]);
+        }
+
+        if (relativePath.Equals("sprites/sprites.txt", StringComparison.OrdinalIgnoreCase))
+            LoadSpriteScale();
     }
 
     // ============================================================
     //   Мелочи
     // ============================================================
 
-    private string ToRelative(string fullPath) =>
-        Path.GetRelativePath(RootPath, fullPath).Replace('\\', '/');
+    private string ToRelative(string fullPath) => Path.GetRelativePath(RootPath, fullPath).Replace('\\', '/');
 
-    private static IEnumerable<string> SafeFiles(string directory, string pattern)
+    private static IEnumerable<string> SafeFiles(string directory, string pattern, SearchOption option)
     {
         if (!Directory.Exists(directory))
             return Array.Empty<string>();
 
         try
         {
-            return Directory.EnumerateFiles(directory, pattern, SearchOption.TopDirectoryOnly);
+            return Directory.GetFiles(directory, pattern, option);
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return Array.Empty<string>();
         }
@@ -515,9 +475,9 @@ internal sealed class AssetStore : IDisposable
 
         try
         {
-            return Directory.EnumerateDirectories(directory);
+            return Directory.GetDirectories(directory);
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return Array.Empty<string>();
         }

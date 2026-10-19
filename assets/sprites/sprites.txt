@@ -1,0 +1,23 @@
+# имя  пикселей_на_метр (картинки нарисованы в старых единицах: 1 = 2.6 м)
+pickup_clip 30.77
+pickup_bulletbox 30.77
+pickup_shells 30.77
+pickup_shellbox 30.77
+pickup_rocket 30.77
+pickup_rocketbox 30.77
+pickup_cell 30.77
+pickup_cellpack 30.77
+pickup_chainsaw 30.77
+pickup_shotgun 30.77
+pickup_chaingun 30.77
+pickup_rocketlauncher 30.77
+pickup_plasmarifle 30.77
+pickup_bfg9000 30.77
+decor_tree 18.46
+decor_pine 18.46
+decor_bush 18.46
+decor_plant 30.77
+decor_floorlamp 30.77
+decor_streetlamp 18.46
+decor_barrel 30.77
+decor_flowers 30.77

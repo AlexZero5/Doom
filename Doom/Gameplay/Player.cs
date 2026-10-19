@@ -18,6 +18,23 @@ internal sealed class Player
 
     public double Y { get; private set; }
 
+    /// <summary>Высота ног (метры).</summary>
+    public double Z { get; private set; }
+
+    /// <summary>Высота глаз: ноги (сглаженные на ступенях) + рост глаз.</summary>
+    public double EyeZ => _eyeFeet + GameConfig.EyeHeight;
+
+    /// <summary>Вертикальная скорость (м/с): прыжок, падение, лестница.</summary>
+    public double VelocityZ { get; private set; }
+
+    /// <summary>Стоит на опоре.</summary>
+    public bool OnGround { get; private set; } = true;
+
+    /// <summary>В объёме вертикальной лестницы.</summary>
+    public bool Climbing { get; private set; }
+
+    private double _eyeFeet;
+
     /// <summary>Направление взгляда в радианах.</summary>
     public double Angle { get; private set; }
 
@@ -46,6 +63,29 @@ internal sealed class Player
     /// <summary>Кулак бьёт по очереди слева и справа (как в Doom).</summary>
     public bool SwingFromLeft { get; private set; }
 
+    /// <summary>Сколько выстрелов сделано (чередует кадры пулемёта).</summary>
+    public int ShotsFired { get; private set; }
+
+    /// <summary>Здоровье и броня — для строки состояния (урона пока нет: врагов нет).</summary>
+    public int Health { get; private set; }
+
+    public int Armor { get; private set; }
+
+    /// <summary>Когда подобрано новое оружие (лицо в строке состояния ухмыляется).</summary>
+    public double WeaponPickupTime { get; private set; }
+
+    /// <summary>С какого момента зажат спуск (NaN — отпущен): долгая стрельба злит лицо.</summary>
+    public double TriggerHeldSince { get; private set; } = double.NaN;
+
+    /// <summary>Отмечает, зажат ли спуск в этом кадре.</summary>
+    public void SetTrigger(bool pressed, double nowSeconds)
+    {
+        if (!pressed)
+            TriggerHeldSince = double.NaN;
+        else if (double.IsNaN(TriggerHeldSince))
+            TriggerHeldSince = nowSeconds;
+    }
+
     public int Bullets => AmmoOf(AmmoKind.Bullets);
 
     public int Shells => AmmoOf(AmmoKind.Shells);
@@ -58,13 +98,14 @@ internal sealed class Player
 
     public bool Owns(WeaponKind kind) => _owned[(int)kind];
 
-    /// <summary>Возвращает игрока в стартовое состояние: кулак, пистолет и 50 патронов.</summary>
-    public void Reset()
+    /// <summary>
+    ///     Возвращает игрока в стартовое состояние: кулак, пистолет и 50 патронов. Точка старта —
+    ///     из карты (без карты — запасная из GameConfig).
+    /// </summary>
+    public void Reset(Level? level = null)
     {
-        X = GameConfig.StartX;
-        Y = GameConfig.StartY;
-        Angle = GameConfig.StartAngle;
-        Pitch = 0;
+        PlaceAt(level?.StartX ?? GameConfig.StartX, level?.StartY ?? GameConfig.StartY, level?.StartZ ?? 0,
+            level?.StartAngle ?? GameConfig.StartAngle);
 
         Array.Clear(_ammo);
         Array.Clear(_owned);
@@ -80,22 +121,146 @@ internal sealed class Player
         BobIntensity = 0;
         SpinPhase = 0;
         SwingFromLeft = false;
+        ShotsFired = 0;
+        Health = 100;
+        Armor = 0;
+        WeaponPickupTime = -10;
+        TriggerHeldSince = double.NaN;
     }
 
-    /// <summary>Двигает игрока в направлении <paramref name="angle" />, скользя по стенам.</summary>
-    public void Move(Level level, double angle, double distance)
+    // ============================================================
+    //   Движение и физика
+    // ============================================================
+
+    /// <summary>
+    ///     Шаг физики: ходьба (<paramref name="forward" />, <paramref name="strafe" /> ∈ [−1, 1]),
+    ///     прыжок, гравитация, подъём на ступени, лазанье по лестницам. Игрок — вертикальный
+    ///     цилиндр: радиус <see cref="GameConfig.PlayerRadius" />, рост <see cref="GameConfig.PlayerHeight" />.
+    /// </summary>
+    public void Simulate(Level level, double forward, double strafe, bool jump, double speed, double deltaSeconds)
     {
-        double nextX = X + Math.Cos(angle) * distance;
-        double nextY = Y + Math.Sin(angle) * distance;
+        const double radius = GameConfig.PlayerRadius;
+        const double height = GameConfig.PlayerHeight;
 
-        if (level.IsWalkable(nextX, Y))
-            X = nextX;
+        // Лестница: в её объёме гравитации нет, W/S — вверх/вниз.
+        Climbing = level.LadderAt(X, Y, radius, Z, Z + height) is not null;
 
-        if (level.IsWalkable(X, nextY))
-            Y = nextY;
+        double moveX = Math.Cos(Angle) * forward + Math.Cos(Angle + Math.PI / 2) * strafe;
+        double moveY = Math.Sin(Angle) * forward + Math.Sin(Angle + Math.PI / 2) * strafe;
+        double length = Math.Sqrt(moveX * moveX + moveY * moveY);
+        if (length > 1)
+        {
+            moveX /= length;
+            moveY /= length;
+        }
+
+        // Мелкими шагами, чтобы не проскочить тонкую стенку на большой скорости.
+        double distance = speed * deltaSeconds;
+        int substeps = Math.Max(1, (int)Math.Ceiling(distance * Math.Max(Math.Abs(moveX), Math.Abs(moveY)) / 0.1));
+        for (int step = 0; step < substeps; step++)
+        {
+            MoveAxis(level, moveX * distance / substeps, 0);
+            MoveAxis(level, 0, moveY * distance / substeps);
+        }
+
+        // Вертикаль.
+        if (Climbing)
+            VelocityZ = forward * GameConfig.ClimbSpeed;
+        else
+            VelocityZ -= GameConfig.Gravity * deltaSeconds;
+
+        if (jump && (OnGround || Climbing))
+        {
+            VelocityZ = GameConfig.JumpSpeed;
+            OnGround = false;
+        }
+
+        double nextZ = Z + VelocityZ * deltaSeconds;
+        if (VelocityZ > 0)
+        {
+            double ceiling = level.CeilingHeight(X, Y, radius, Z + height - 0.05);
+            if (nextZ + height > ceiling)
+            {
+                nextZ = Math.Max(Z, ceiling - height);
+                VelocityZ = 0;
+            }
+        }
+
+        double ground = level.GroundHeight(X, Y, radius, Math.Max(Z, nextZ) + 0.05);
+        bool wasOnGround = OnGround;
+        if (nextZ <= ground)
+        {
+            Z = ground;
+            VelocityZ = 0;
+            OnGround = true;
+        }
+        else if (wasOnGround && VelocityZ <= 0 && !Climbing && Z - ground <= GameConfig.StepHeight)
+        {
+            // Вниз по ступеням — не подпрыгивая на каждой.
+            Z = ground;
+            VelocityZ = 0;
+            OnGround = true;
+        }
+        else
+        {
+            Z = nextZ;
+            OnGround = false;
+        }
+
+        // Камера догоняет ноги плавно на ступенях и мгновенно — при падении и прыжке.
+        double lag = Z - _eyeFeet;
+        _eyeFeet = OnGround && Math.Abs(lag) < 0.5 ? _eyeFeet + lag * Math.Min(1, deltaSeconds * 14) : Z;
     }
 
-    public void Turn(double deltaRadians) => Angle += deltaRadians;
+    /// <summary>Сдвиг по одной оси со скольжением вдоль стен и подъёмом на невысокие уступы.</summary>
+    private void MoveAxis(Level level, double dx, double dy)
+    {
+        if (dx == 0 && dy == 0)
+            return;
+
+        double nextX = X + dx, nextY = Y + dy;
+        if (!BlockedAt(level, nextX, nextY, Z))
+        {
+            X = nextX;
+            Y = nextY;
+            return;
+        }
+
+        if (!OnGround && !Climbing)
+            return;
+
+        // Ступенька: опора впереди не выше StepHeight и над ней есть место.
+        double step = level.GroundHeight(nextX, nextY, GameConfig.PlayerRadius, Z + GameConfig.StepHeight);
+        if (step > Z && !BlockedAt(level, nextX, nextY, step))
+        {
+            X = nextX;
+            Y = nextY;
+            Z = step;
+        }
+    }
+
+    private static bool BlockedAt(Level level, double x, double y, double feet) =>
+        level.Blocked(x, y, GameConfig.PlayerRadius, feet + 0.01, feet + GameConfig.PlayerHeight);
+
+    /// <summary>Ставит игрока в точку (старт, рестарт, телепорт стенда).</summary>
+    public void PlaceAt(double x, double y, double z, double angle, double pitch = 0)
+    {
+        X = x;
+        Y = y;
+        Z = z;
+        _eyeFeet = z;
+        Angle = angle;
+        Pitch = pitch;
+        VelocityZ = 0;
+        OnGround = true;
+    }
+
+    /// <summary>Поворачивает взгляд; угол держится в [0, 2π), чтобы не терять точность за долгую игру.</summary>
+    public void Turn(double deltaRadians)
+    {
+        double angle = (Angle + deltaRadians) % Math.Tau;
+        Angle = angle < 0 ? angle + Math.Tau : angle;
+    }
 
     /// <summary>Наклоняет взгляд по вертикали, удерживая угол в разумных пределах.</summary>
     public void TurnPitch(double deltaRadians) =>
@@ -245,6 +410,7 @@ internal sealed class Player
         }
 
         LastFireTime = nowSeconds;
+        ShotsFired++;
         MuzzleFlashUntil = nowSeconds + info.MuzzleFlashSeconds;
 
         if (info.IsMelee)
@@ -275,7 +441,7 @@ internal sealed class Player
 
             double dx = pickup.X - X;
             double dy = pickup.Y - Y;
-            if (dx * dx + dy * dy > radiusSquared)
+            if (dx * dx + dy * dy > radiusSquared || pickup.Z < Z - 0.6 || pickup.Z > Z + 1.2)
                 continue;
 
             PickupInfo info = PickupCatalog.Get(pickup.Kind);
@@ -288,7 +454,10 @@ internal sealed class Player
 
                 // Как в Doom: найденное оружие поднимается сразу, а знакомое — нет.
                 if (!alreadyOwned)
+                {
                     SelectWeapon(weapon, nowSeconds);
+                    WeaponPickupTime = nowSeconds;
+                }
             }
             else
             {

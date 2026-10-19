@@ -16,10 +16,15 @@ internal static class ColorRgb
     /// <summary>Смешивает два цвета: <paramref name="alpha" /> = 0 — фон, 1 — передний план.</summary>
     public static int Blend(int background, int foreground, double alpha)
     {
-        int r = (int)(Red(background) + (Red(foreground) - Red(background)) * alpha);
-        int g = (int)(Green(background) + (Green(foreground) - Green(background)) * alpha);
-        int b = (int)(Blue(background) + (Blue(foreground) - Blue(background)) * alpha);
+        // Целочисленная арифметика с весом 0..256: смешивание вызывается на каждую ячейку
+        // при засветке и затемнении меню, а double-версия была заметно дороже.
+        int weight = alpha <= 0 ? 0 : alpha >= 1 ? 256 : (int)(alpha * 256 + 0.5);
+        int inverse = 256 - weight;
 
-        return Pack(r, g, b);
+        int r = (Red(background) * inverse + Red(foreground) * weight) >> 8;
+        int g = (Green(background) * inverse + Green(foreground) * weight) >> 8;
+        int b = (Blue(background) * inverse + Blue(foreground) * weight) >> 8;
+
+        return (r << 16) | (g << 8) | b;
     }
 }

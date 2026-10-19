@@ -6,10 +6,18 @@ namespace Doom.Gameplay;
 /// <summary>
 ///     Система снарядов: единственное место, где движутся ракеты, плазменные заряды и шар BFG,
 ///     где рождаются искры, дым и взрывы и где копится засветка кадра от выстрелов.
+///     Снаряд летит строго по направлению взгляда (с наклоном) и взрывается там, где его путь
+///     за кадр пересёк мир: стену, пол, потолок, дверь, мебель.
 /// </summary>
 internal sealed class ProjectileSystem
 {
+    /// <summary>Эффект чуть отодвигается от поверхности навстречу лучу, чтобы не тонуть в ней.</summary>
+    private const double SurfaceOffset = 0.12;
+
     private readonly List<Projectile> _projectiles = new();
+
+    /// <summary>Взорвавшиеся снаряды для переиспользования: стрельба не мусорит в куче.</summary>
+    private readonly Stack<Projectile> _freeProjectiles = new();
     private readonly List<Impact> _impacts = new();
 
     private double _flashPeak;
@@ -47,6 +55,9 @@ internal sealed class ProjectileSystem
 
     public void Reset()
     {
+        foreach (Projectile projectile in _projectiles)
+            _freeProjectiles.Push(projectile);
+
         _projectiles.Clear();
         _impacts.Clear();
         FlashIntensity = 0;
@@ -58,44 +69,19 @@ internal sealed class ProjectileSystem
         _puffSeed = 0;
     }
 
-    /// <summary>
-    ///     Запускает снаряд из точки игрока в направлении взгляда. Наклон ствола
-    ///     (<paramref name="pitch" />) задаёт вертикальную скорость: снаряд взлетает
-    ///     к потолку или падает к полу и взрывается о них. Спрайт рождается на своей
-    ///     штатной высоте (центр полосы из каталога) — там, где рисуется ствол.
-    /// </summary>
-    public void Launch(ProjectileKind kind, double x, double y, double angle, double pitch = 0.0)
+    /// <summary>Запускает снаряд из глаз игрока по направлению взгляда.</summary>
+    public void Launch(ProjectileKind kind, Vec3 eye, Vec3 direction)
     {
         if (kind == ProjectileKind.None || _projectiles.Count >= GameConfig.MaxProjectiles)
             return;
 
-        double directionX = Math.Cos(angle);
-        double directionY = Math.Sin(angle);
         ProjectileInfo info = ProjectileCatalog.Get(kind);
-
-        // Вертикальная скорость из наклона взгляда: стрельба вверх уводит снаряд к потолку.
-        double velocityZ = Math.Clamp(Math.Tan(pitch), -1.0, 1.0) * info.Speed;
-
-        AcquireProjectile().Reset(
-            kind,
-            x + directionX * GameConfig.ProjectileSpawnOffset,
-            y + directionY * GameConfig.ProjectileSpawnOffset,
-            directionX,
-            directionY,
-            info.TrailSeconds,
-            z: info.SpawnZCenter,
-            bandHalf: info.BandHalf,
-            velocityZ);
+        AcquireProjectile().Reset(kind, eye + direction * GameConfig.ProjectileSpawnOffset, direction, info.TrailSeconds);
     }
 
-    /// <summary>Искра от мгновенного выстрела: точка попадания чуть отодвинута от стены к игроку.</summary>
-    public void SpawnHitSpark(ImpactKind kind, double originX, double originY, double angle, double distance)
-    {
-        double offset = Math.Max(0.0, distance - GameConfig.SparkOffsetFromWall);
-        AddImpact(kind, originX + Math.Cos(angle) * offset, originY + Math.Sin(angle) * offset);
-    }
+    /// <summary>Искра в точке попадания пули или удара (чуть перед поверхностью).</summary>
+    public void SpawnHitSpark(ImpactKind kind, Vec3 point, Vec3 normal) => AddImpact(kind, point + normal * 0.06);
 
-    /// <summary>Добавляет засветку кадра: вспышку выстрела или взрыва.</summary>
     public void AddFlash(double intensity, double seconds, int color)
     {
         if (intensity <= 0 || seconds <= 0)
@@ -112,7 +98,6 @@ internal sealed class ProjectileSystem
         FlashColor = color;
     }
 
-    /// <summary>Двигает снаряды, старит эффекты и гасит засветку.</summary>
     public void Update(double deltaSeconds, Level level)
     {
         UpdateProjectiles(deltaSeconds, level);
@@ -125,85 +110,44 @@ internal sealed class ProjectileSystem
         for (int index = _projectiles.Count - 1; index >= 0; index--)
         {
             Projectile projectile = _projectiles[index];
-            if (!projectile.Alive)
+            ProjectileInfo info = ProjectileCatalog.Get(projectile.Kind);
+            projectile.Advance(deltaSeconds);
+
+            double step = info.Speed * deltaSeconds;
+            if (level.RayCast(projectile.Position, projectile.Direction, step, out RayHit hit))
             {
-                _projectiles.RemoveAt(index);
+                Explode(info, hit.Point - projectile.Direction * SurfaceOffset);
+                Release(index);
                 continue;
             }
 
-            projectile.Advance(deltaSeconds);
-            projectile.RaiseZ(projectile.VelocityZ * deltaSeconds);
-            ProjectileInfo info = ProjectileCatalog.Get(projectile.Kind);
+            projectile.MoveTo(projectile.Position + projectile.Direction * step);
 
-            // Пол есть везде: взрыв, когда нижний край спрайта коснулся пола. Потолок —
-            // только внутри зданий: на открытом небе снаряд улетает вверх и летит дальше.
-            bool hitFloor = projectile.Z - projectile.BandHalf <= 0.02;
-            bool hitCeiling = projectile.Z + projectile.BandHalf >= 0.98
-                              && level.CeilingAt((int)projectile.X, (int)projectile.Y) > 0;
-
-            if (hitFloor || hitCeiling
-                || AdvanceThroughLevel(projectile, deltaSeconds, info, level)
-                || projectile.Age >= info.Lifetime)
+            if (projectile.Age >= info.Lifetime || projectile.Z < -20)
             {
-                Explode(info, projectile, hitFloor, hitCeiling);
-                _projectiles.RemoveAt(index);
+                Explode(info, projectile.Position);
+                Release(index);
                 continue;
             }
 
             if (info.TrailSeconds > 0 && projectile.TryEmitTrail(deltaSeconds, info.TrailSeconds))
-            {
-                // След визуально привязан к снаряду: смещение от штатной высоты следа.
-                AddImpact(info.TrailImpact, projectile.X, projectile.Y,
-                    projectile.Z - info.SpawnZCenter);
-            }
+                AddImpact(info.TrailImpact, projectile.Position - projectile.Direction * 0.2);
         }
     }
 
-    /// <summary>Двигает снаряд мелкими шагами. Возвращает <c>true</c>, если путь упёрся в стену.</summary>
-    private static bool AdvanceThroughLevel(
-        Projectile projectile, double deltaSeconds, ProjectileInfo info, Level level)
-    {
-        double remaining = info.Speed * deltaSeconds;
-
-        while (remaining > 0)
-        {
-            double step = Math.Min(remaining, GameConfig.MaxProjectileStep);
-            remaining -= step;
-
-            double nextX = projectile.X + projectile.DirectionX * step;
-            double nextY = projectile.Y + projectile.DirectionY * step;
-
-            if (!level.IsWalkable(nextX, nextY))
-                return true;
-
-            projectile.MoveTo(nextX, nextY);
-        }
-
-        return false;
-    }
-
-    /// <summary>Взрыв снаряда: огонь, засветка кадра и разлёт клубов дыма. Осколки висят на высоте взрыва.</summary>
-    private void Explode(ProjectileInfo info, Projectile projectile, bool hitFloor, bool hitCeiling)
+    private void Explode(ProjectileInfo info, Vec3 point)
     {
         ImpactInfo impact = ImpactCatalog.Get(info.Impact);
 
-        // Смещение эффекта от его штатной высоты: у пола — прижат к полу, у потолка —
-        // прижат к потолку, в воздухе — там, где летел снаряд.
-        double explosionOffset = hitFloor ? -0.4 : hitCeiling ? 0.5 : projectile.Z - info.SpawnZCenter;
-
-        AddImpact(info.Impact, projectile.X, projectile.Y, explosionOffset);
+        AddImpact(info.Impact, point);
         AddFlash(impact.Flash, impact.FlashSeconds, impact.FlashColor);
 
         for (int index = 0; index < impact.PuffCount; index++)
         {
             double angle = index * (Math.Tau / impact.PuffCount) + _puffSeed * 1.13;
-            double distance = impact.PuffDistance * (0.55 + 0.45 * SpreadNoise.Unit(index, _puffSeed));
-
-            AddImpact(
-                ImpactKind.ExplosionPuff,
-                projectile.X + Math.Cos(angle) * distance,
-                projectile.Y + Math.Sin(angle) * distance,
-                explosionOffset);
+            double distance = impact.PuffDistance * 2.6 * (0.55 + 0.45 * SpreadNoise.Unit(index, _puffSeed));
+            AddImpact(ImpactKind.ExplosionPuff,
+                point + new Vec3(Math.Cos(angle) * distance, Math.Sin(angle) * distance, 0.2 * SpreadNoise.Unit(_puffSeed, index)));
         }
 
         _puffSeed++;
@@ -236,33 +180,31 @@ internal sealed class ProjectileSystem
         FlashIntensity = _flashPeak * (_flashRemaining / _flashSeconds);
     }
 
-    private void AddImpact(ImpactKind kind, double x, double y, double z = 0.0)
+    private void AddImpact(ImpactKind kind, Vec3 position)
     {
         ImpactInfo info = ImpactCatalog.Get(kind);
         double scale = 0.85 + 0.30 * SpreadNoise.Unit(_impactSeed, (int)kind * 31);
         _impactSeed++;
 
-        AcquireImpact().Reset(kind, x, y, info.Duration, scale, z);
+        AcquireImpact().Reset(kind, position.X, position.Y, info.Duration, scale, position.Z);
     }
 
-    /// <summary>Берёт снаряд для переиспользования, чтобы не мусорить в куче.</summary>
     private Projectile AcquireProjectile()
     {
-        foreach (Projectile projectile in _projectiles)
-        {
-            if (!projectile.Alive)
-                return projectile;
-        }
-
-        var created = new Projectile();
-        _projectiles.Add(created);
-        return created;
+        Projectile projectile = _freeProjectiles.Count > 0 ? _freeProjectiles.Pop() : new Projectile();
+        _projectiles.Add(projectile);
+        return projectile;
     }
 
-    /// <summary>
-    ///     Берёт слот эффекта: пока список не заполнен — создаёт новый, иначе перезаписывает
-    ///     самый давний эффект (они короткоживущие, поэтому вытесненные уже не видны).
-    /// </summary>
+    private void Release(int index)
+    {
+        Projectile projectile = _projectiles[index];
+        projectile.Kill();
+        _projectiles.RemoveAt(index);
+        _freeProjectiles.Push(projectile);
+    }
+
+    /// <summary>Эффект из кольцевого буфера: при переполнении заменяется самый старый.</summary>
     private Impact AcquireImpact()
     {
         if (_impacts.Count < GameConfig.MaxImpacts)

@@ -5,57 +5,59 @@ using Doom.World;
 
 namespace Doom.Rendering;
 
-/// <summary>Отрисовка кадра: небо, полы и потолки, стены, спрайты, оружие и строка статуса.</summary>
+/// <summary>
+///     Кадр целиком: трёхмерный вид рисуется во внутреннем кадре пониженного разрешения
+///     (настройка «Разрешение»), растягивается на верх экрана, а поверх — засветка, оружие,
+///     прицел и строка состояния уже в полном разрешении терминала: HUD и меню всегда чёткие.
+/// </summary>
 internal sealed class SceneRenderer
 {
-    /// <summary>Минимальная ширина кадра для параллельного рендера колонок.</summary>
-    private const int ParallelismThreshold = 80;
+    /// <summary>Старые единицы эффектов и снарядов (1 = 2.6 м) → метры.</summary>
+    private const double OldUnit = 2.6;
 
-    // Освещение полов и потолков — те же законы, что у стен и спрайтов.
-    private const double LightRange = 7.0;
-    private const double LightOffset = 2.0;
-    private const double MinBrightness = 0.02;
-    private const double Gamma = 1.0 / 1.6;
+    private const int FallbackSkyTop = 0x3a5a8c;
+    private const int FallbackSkyHorizon = 0xa8b8c8;
 
-    /// <summary>Дальние половины кадров за пределами трассировки рисуются почти чёрными.</summary>
-    private const double MaxSurfaceDistance = 64.0;
+    private readonly Rasterizer _rasterizer = new();
+    private readonly WeaponRenderer _weapon;
+    private readonly HudRenderer _hud;
+    private readonly List<Face> _scratch = new();
+    private readonly List<Texture?> _frameTextures = new();
+    private readonly Dictionary<Texture, int> _spriteIndex = new(ReferenceEqualityComparer.Instance);
+    private readonly Func<int, int, int> _skyFunction;
 
-    private readonly List<SpriteQuad> _visibleSprites = new();
-    private SpriteQuad[] _spriteCache = Array.Empty<SpriteQuad>();
+    private Level? _texturesFor;
+    private int _texturesVersion = -1;
+    private int _levelTextureCount;
+    private Texture? _sky;
+    private Camera _camera;
+    private int[] _columnMap = Array.Empty<int>();
+    private int[] _rowMap = Array.Empty<int>();
+    private int _colorMask = 0xFFFFFF;
 
-    // Контекст кадра для кэшированного делегата Parallel.For (без аллокаций на кадр).
-    private Framebuffer _frameBuffer = null!;
-    private Viewport _viewport;
-    private Level _level = null!;
-    private Player _player = null!;
-    private int _spriteCount;
-    private readonly Action<int> _renderColumnAction;
-
-    // Предвычисленное на кадр: одинаково для всех колонок.
-    private double _horizon;
-    private int _pixelRows;
-    private double[] _floorRowDistance = Array.Empty<double>();
-    private double[] _ceilingRowDistance = Array.Empty<double>();
-    private double[] _floorBrightness = Array.Empty<double>();
-    private double[] _ceilingBrightness = Array.Empty<double>();
-    private double[] _skyTexV = Array.Empty<double>();
-
-    // Кэш текстур полов/потолков на кадр: словарь ассетов слишком дорог на каждый пиксель.
-    private readonly Texture?[] _floorTextureCache = new Texture?[16];
-    private readonly Texture?[] _ceilingTextureCache = new Texture?[16];
-    private readonly Texture?[] _wallTextureCache = new Texture?[16];
-    private Texture? _skyboxTexture;
+    private static readonly string[] PickupSprites =
+        Enum.GetValues<PickupKind>().Select(kind => "pickup_" + kind.ToString().ToLowerInvariant()).ToArray();
 
     public SceneRenderer(AssetStore? assets = null)
     {
         Assets = assets;
-        _renderColumnAction = RenderColumnFromContext;
+        _weapon = new WeaponRenderer(assets);
+        _hud = new HudRenderer(assets);
+        _skyFunction = SkyAt;
     }
 
-    /// <summary>Хранилище текстур (может отсутствовать — тогда всё рисуется процедурно).</summary>
     public AssetStore? Assets { get; }
 
-    /// <summary>Рисует кадр: небо, полы и потолки, стены, спрайты, засветку, оружие и статус.</summary>
+    public HudRenderer Hud => _hud;
+
+    /// <summary>Сколько треугольников ушло в растеризацию в последнем кадре (для замеров).</summary>
+    public int LastTriangleCount => _rasterizer.TriangleCount;
+
+    /// <summary>Размер внутреннего кадра трёхмерного вида для окна (для подписи в настройках).</summary>
+    public static (int Width, int Height) InternalSize(int columns, int pixelRows, double scale) =>
+        (Math.Max(16, (int)Math.Round(columns / scale)), Math.Max(8, (int)Math.Round(pixelRows / scale)));
+
+    /// <summary>Рисует кадр целиком.</summary>
     public void Render(
         Framebuffer framebuffer,
         Viewport viewport,
@@ -65,538 +67,357 @@ internal sealed class SceneRenderer
         ProjectileSystem projectiles,
         double nowSeconds,
         double flashIntensity = 0.0,
-        int flashColor = 0)
+        int flashColor = 0,
+        MotionDetail motion = MotionDetail.Full)
     {
-        _frameBuffer = framebuffer;
-        _viewport = viewport;
-        _level = level;
-        _player = player;
-        _pixelRows = viewport.PixelRows;
-        _horizon = viewport.HorizonPixels(player.Pitch);
+        PrepareTextures(level);
 
-        PrepareRowCaches();
-        Array.Clear(_floorTextureCache);
-        Array.Clear(_ceilingTextureCache);
-        Array.Clear(_wallTextureCache);
-        _skyboxTexture = Assets?.GetSkybox();
-
-        _visibleSprites.Clear();
-        SpriteProjector.ProjectPickups(viewport, player, pickups, _visibleSprites);
-        SpriteProjector.ProjectDynamics(viewport, player, projectiles.Projectiles, projectiles.Impacts,
-            _visibleSprites, Assets);
-        _visibleSprites.Sort(SpriteQuad.CompareByDistance);
-
-        if (_spriteCache.Length < _visibleSprites.Count)
-            _spriteCache = new SpriteQuad[_visibleSprites.Count];
-
-        _visibleSprites.CopyTo(_spriteCache);
-        _spriteCount = _visibleSprites.Count;
-
-        if (viewport.Columns < ParallelismThreshold)
+        // Динамическое разрешение: в движении внутренний кадр ещё меньше (деталей всё равно не
+        // разглядеть), а цвет грубее — терминалу уходит заметно меньше байтов. Встали — полный кадр.
+        double scale = GameSettings.Current.RenderScale * motion switch
         {
-            for (int x = 0; x < viewport.Columns; x++)
-                RenderColumn(x);
-        }
-        else
-        {
-            Parallel.For(0, viewport.Columns, _renderColumnAction);
-        }
+            MotionDetail.Soft => 1.35,
+            MotionDetail.Strong => 2.0,
+            _ => 1.0
+        };
+        _colorMask = motion switch { MotionDetail.Soft => 0xF8F8F8, MotionDetail.Strong => 0xF0F0F0, _ => 0xFFFFFF };
 
-        ApplyFlash(framebuffer, flashIntensity, flashColor);
-        WeaponRenderer.Draw(framebuffer, viewport, player, nowSeconds, Assets);
-        HudRenderer.Draw(framebuffer, player);
+        (int width, int height) = InternalSize(viewport.Columns, viewport.PixelRows, Math.Min(scale, 6.0));
+        _camera = new Camera(new Vec3(player.X, player.Y, player.EyeZ), player.Angle, player.Pitch,
+            viewport.FieldOfViewRadians, width, height);
+
+        // Сначала подвижное (двери, спрайты): их текстуры дописываются в таблицу кадра.
+        _scratch.Clear();
+        foreach (Door door in level.Doors)
+            door.AppendFaces(_scratch);
+        AddPickups(pickups);
+        AddDecorations(level);
+        AddDynamics(projectiles);
+
+        _rasterizer.Begin(_camera, _frameTextures);
+        AddLevel(level);
+        foreach (Face face in _scratch)
+            _rasterizer.AddFace(face);
+
+        _rasterizer.Rasterize(_skyFunction);
+        Present(framebuffer, viewport);
+
+        ApplyFlash(framebuffer, viewport, flashIntensity, flashColor);
+        _weapon.Draw(framebuffer, viewport, player, nowSeconds);
+        if (GameSettings.Current.Crosshair)
+            DrawCrosshair(framebuffer, viewport);
+        _hud.Draw(framebuffer, viewport.Rows, player, nowSeconds);
     }
 
-    /// <summary>Засветка игрового поля от выстрела или взрыва; строка состояния не затрагивается.</summary>
-    private static void ApplyFlash(Framebuffer framebuffer, double intensity, int color)
+    // ============================================================
+    //   Текстуры кадра: таблица уровня + спрайты этого кадра
+    // ============================================================
+
+    private void PrepareTextures(Level level)
+    {
+        int version = Assets?.Version ?? 0;
+        if (!ReferenceEquals(level, _texturesFor) || version != _texturesVersion || _levelTextureCount != level.TextureNames.Count)
+        {
+            _frameTextures.Clear();
+            _frameTextures.Add(null);
+            for (int i = 1; i < level.TextureNames.Count; i++)
+                _frameTextures.Add(Assets?.GetTexture(level.TextureNames[i]) ?? FallbackTexture(level.TextureNames[i]));
+
+            _levelTextureCount = level.TextureNames.Count;
+            _sky = Assets?.GetSky(level.Sky);
+            _texturesFor = level;
+            _texturesVersion = version;
+        }
+
+        // Спрайты прошлого кадра выбрасываются: таблица остаётся только уровня.
+        _frameTextures.RemoveRange(_levelTextureCount, _frameTextures.Count - _levelTextureCount);
+        _spriteIndex.Clear();
+    }
+
+    /// <summary>Нет картинки — серая «клетка», чтобы грань всё равно была видна.</summary>
+    private static Texture FallbackTexture(string name)
+    {
+        var pixels = new int[8 * 8];
+        int seed = name.Aggregate(17, (hash, c) => hash * 31 + c);
+        int baseColor = 0x606060 + (seed & 0x1f) * 0x010101;
+        for (int i = 0; i < pixels.Length; i++)
+            pixels[i] = unchecked((int)0xFF000000) | (((i / 8 + i % 8) & 1) == 0 ? baseColor : baseColor - 0x101010);
+        return new Texture(name, 8, 8, pixels);
+    }
+
+    private int SpriteTexture(Texture texture)
+    {
+        if (_spriteIndex.TryGetValue(texture, out int index))
+            return index;
+
+        index = _frameTextures.Count;
+        _frameTextures.Add(texture);
+        _spriteIndex[texture] = index;
+        return index;
+    }
+
+    // ============================================================
+    //   Уровень: куски, видимые камерой
+    // ============================================================
+
+    private void AddLevel(Level level)
+    {
+        double kx = (_camera.Width * 0.5 + 2) / _camera.Focal;
+        double ky = (_camera.Height * 0.5 + 2) / _camera.Focal;
+        List<Face> faces = level.Faces;
+
+        foreach (FaceChunk chunk in level.Chunks)
+        {
+            if (!ChunkVisible(chunk, kx, ky))
+                continue;
+
+            foreach (int index in chunk.Faces)
+                _rasterizer.AddFace(faces[index]);
+        }
+    }
+
+    /// <summary>Отсечение по пирамиде видимости: все 8 углов габаритов за одной гранью — не видно.</summary>
+    private bool ChunkVisible(FaceChunk chunk, double kx, double ky)
+    {
+        int outside = 0x1F;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            var point = new Vec3(
+                (corner & 1) == 0 ? chunk.Min.X : chunk.Max.X,
+                (corner & 2) == 0 ? chunk.Min.Y : chunk.Max.Y,
+                (corner & 4) == 0 ? chunk.Min.Z : chunk.Max.Z);
+            (double x, double y, double z) = _camera.ToView(point);
+
+            int code = 0;
+            if (z < 0.05) code |= 1;
+            if (x < -z * kx) code |= 2;
+            if (x > z * kx) code |= 4;
+            if (y < -z * ky) code |= 8;
+            if (y > z * ky) code |= 16;
+            outside &= code;
+            if (outside == 0)
+                return true;
+        }
+
+        return outside == 0;
+    }
+
+    // ============================================================
+    //   Спрайты: бонусы, декорации, снаряды, эффекты
+    // ============================================================
+
+    private void AddPickups(IReadOnlyList<Pickup> pickups)
+    {
+        foreach (Pickup pickup in pickups)
+        {
+            if (pickup.Taken)
+                continue;
+
+            string name = PickupSprites[(int)pickup.Kind];
+            Texture? texture = Assets?.GetSprite(name);
+            if (texture is null)
+                continue;
+
+            double ppu = Assets!.SpritePixelsPerUnit(name);
+            AddUpright(texture, pickup.X, pickup.Y, pickup.Z, texture.Width / ppu, texture.Height / ppu);
+        }
+    }
+
+    private void AddDecorations(Level level)
+    {
+        foreach (Decoration decoration in level.Decorations)
+        {
+            Texture? texture = Assets?.GetSprite(decoration.Sprite);
+            if (texture is null)
+                continue;
+
+            double ppu = Assets!.SpritePixelsPerUnit(decoration.Sprite);
+            AddUpright(texture, decoration.X, decoration.Y, decoration.Z, texture.Width / ppu, texture.Height / ppu);
+        }
+    }
+
+    private void AddDynamics(ProjectileSystem projectiles)
+    {
+        foreach (Projectile projectile in projectiles.Projectiles)
+        {
+            if (!projectile.Alive)
+                continue;
+
+            Texture? frame = Assets?.GetAnimation(ProjectileAnimation(projectile.Kind))?.Sample(projectile.Age);
+            if (frame is null)
+                continue;
+
+            double width = ProjectilePalette.Get(projectile.Kind).Width * 1.6 * OldUnit;
+            AddFacing(frame, new Vec3(projectile.X, projectile.Y, projectile.Z), width, width * frame.Height / frame.Width,
+                fullBright: true, mirrored: false);
+        }
+
+        foreach (Impact impact in projectiles.Impacts)
+        {
+            if (impact.IsExpired)
+                continue;
+
+            (string clip, bool glow) = ImpactAnimation(impact.Kind);
+            Texture? frame = Assets?.GetAnimation(clip)?.SampleProgress(impact.Progress);
+            if (frame is null)
+                continue;
+
+            ImpactVisual visual = ImpactPalette.Get(impact.Kind);
+            double width = visual.Width * OldUnit * impact.Scale * (1.0 + (visual.Growth - 1.0) * impact.Progress);
+            var center = new Vec3(impact.X, impact.Y, impact.Z + visual.Rise * OldUnit * impact.Age);
+            AddFacing(frame, center, width, width * frame.Height / frame.Width, glow, impact.Scale > 1.0);
+        }
+    }
+
+    private static string ProjectileAnimation(ProjectileKind kind) => kind switch
+    {
+        ProjectileKind.Rocket => "rocket",
+        ProjectileKind.PlasmaBolt => "plasma_ball",
+        _ => "bfg_ball"
+    };
+
+    /// <summary>Анимация эффекта и светится ли она сама.</summary>
+    private static (string Clip, bool Glow) ImpactAnimation(ImpactKind kind) => kind switch
+    {
+        ImpactKind.BulletSpark or ImpactKind.MeleeSpark => ("puff", false),
+        ImpactKind.RocketTrail or ImpactKind.ExplosionPuff => ("smoke", false),
+        ImpactKind.PlasmaTrail or ImpactKind.PlasmaImpact => ("plasma_impact", true),
+        ImpactKind.BfgTrail => ("bfg_ball", true),
+        ImpactKind.BfgImpact => ("bfg_impact", true),
+        _ => ("explosion", true)
+    };
+
+    /// <summary>Стоячий спрайт (дерево, бонус): вертикален, поворачивается к камере вокруг оси.</summary>
+    private void AddUpright(Texture texture, double x, double y, double z, double width, double height)
+    {
+        Vec3 right = _camera.Right * (width * 0.5);
+        var bottom = new Vec3(x, y, z);
+        var top = new Vec3(x, y, z + height);
+        AddSprite(texture, top - right, top + right, bottom + right, bottom - right, fullBright: false, mirrored: false);
+    }
+
+    /// <summary>Спрайт «лицом к камере» (снаряд, вспышка, дым).</summary>
+    private void AddFacing(Texture texture, Vec3 center, double width, double height, bool fullBright, bool mirrored)
+    {
+        Vec3 right = _camera.Right * (width * 0.5), up = _camera.Up * (height * 0.5);
+        AddSprite(texture, center - right + up, center + right + up, center + right - up, center - right - up, fullBright, mirrored);
+    }
+
+    private void AddSprite(Texture texture, Vec3 topLeft, Vec3 topRight, Vec3 bottomRight, Vec3 bottomLeft, bool fullBright,
+        bool mirrored)
+    {
+        double u0 = mirrored ? 1 : 0, u1 = mirrored ? 0 : 1;
+        FaceFlags flags = FaceFlags.AlphaTest | FaceFlags.Clamp | FaceFlags.DoubleSided | (fullBright ? FaceFlags.FullBright : 0);
+        _scratch.Add(Face.Create(topLeft, topRight, bottomRight, bottomLeft,
+            (u0, 0), (u1, 0), (u1, 0.999), (u0, 0.999), SpriteTexture(texture), -_camera.Forward, flags));
+    }
+
+    // ============================================================
+    //   Небо
+    // ============================================================
+
+    /// <summary>Небо по направлению луча пикселя: панорама по курсу и высоте над горизонтом.</summary>
+    private int SkyAt(int x, int y)
+    {
+        Vec3 ray = _camera.RayThrough(x + 0.5, y + 0.5);
+        double horizontal = Math.Sqrt(ray.X * ray.X + ray.Y * ray.Y);
+        double elevation = Math.Atan2(ray.Z, horizontal);
+        Texture? sky = _sky;
+
+        if (sky is null)
+        {
+            double t = Math.Clamp(elevation / (Math.PI / 2), 0, 1);
+            return ColorRgb.Blend(FallbackSkyHorizon, FallbackSkyTop, t);
+        }
+
+        double u = Math.Atan2(ray.Y, ray.X) / Math.Tau;
+        u -= Math.Floor(u);
+        double v = Math.Clamp(1.0 - elevation / (Math.PI / 2), 0.0, 0.999);
+        int argb = sky.Pixels[(int)(v * sky.Height) * sky.Width + Math.Min(sky.Width - 1, (int)(u * sky.Width))];
+
+        // Ниже горизонта (видно только за краем мира) — затемнённая дымка горизонта.
+        return elevation < 0 ? ColorRgb.Blend(argb & 0xFFFFFF, 0x202428, Math.Min(1, -elevation * 3)) : argb & 0xFFFFFF;
+    }
+
+    // ============================================================
+    //   Вывод внутреннего кадра на экран
+    // ============================================================
+
+    /// <summary>Растягивает внутренний кадр на строки вида (ближайший пиксель).</summary>
+    private void Present(Framebuffer framebuffer, Viewport viewport)
+    {
+        int columns = viewport.Columns, pixelRows = viewport.PixelRows;
+        int width = _rasterizer.Width, height = _rasterizer.Height;
+
+        if (_columnMap.Length != columns || _columnMap.Length > 0 && _columnMap[^1] >= width)
+            _columnMap = new int[columns];
+        for (int x = 0; x < columns; x++)
+            _columnMap[x] = Math.Min(width - 1, x * width / columns);
+
+        // Если внутренний кадр не выше числа строк терминала, обе половинки ячейки берут одну
+        // строку: ячейка одноцветная, и терминалу хватает одной смены цвета (меньше байтов).
+        if (_rowMap.Length != pixelRows)
+            _rowMap = new int[pixelRows];
+        bool wholeCells = height <= viewport.Rows;
+        for (int y = 0; y < pixelRows; y++)
+            _rowMap[y] = wholeCells ? Math.Min(height - 1, (y >> 1) * height / viewport.Rows) : Math.Min(height - 1, y * height / pixelRows);
+
+        int[] source = _rasterizer.Color;
+        int mask = _colorMask;
+        for (int pixel = 0; pixel < pixelRows; pixel++)
+        {
+            int rowBase = (pixel >> 1) * framebuffer.Columns;
+            int[] target = (pixel & 1) == 0 ? framebuffer.Foreground : framebuffer.Background;
+            int sourceRow = _rowMap[pixel] * width;
+            for (int x = 0; x < columns; x++)
+                target[rowBase + x] = source[sourceRow + _columnMap[x]] & mask;
+        }
+
+        Array.Fill(framebuffer.Chars, Framebuffer.UpperHalfBlock, 0, viewport.Rows * framebuffer.Columns);
+    }
+
+    /// <summary>Засветка трёхмерного вида от выстрела или взрыва.</summary>
+    private static void ApplyFlash(Framebuffer framebuffer, Viewport viewport, double intensity, int color)
     {
         if (intensity <= 0.001)
             return;
 
-        int cells = (framebuffer.Rows - 1) * framebuffer.Columns;
+        int cells = viewport.Rows * framebuffer.Columns;
+        int[] foreground = framebuffer.Foreground;
+        int[] background = framebuffer.Background;
 
         for (int index = 0; index < cells; index++)
         {
-            framebuffer.Foreground[index] = ColorRgb.Blend(framebuffer.Foreground[index], color, intensity);
-            framebuffer.Background[index] = ColorRgb.Blend(framebuffer.Background[index], color, intensity);
+            foreground[index] = ColorRgb.Blend(foreground[index], color, intensity);
+            background[index] = ColorRgb.Blend(background[index], color, intensity);
         }
     }
 
-    /// <summary>
-    ///     На кадр: расстояния и яркость строк пола/потолка (зависят только от вертикали),
-    ///     V-координаты неба. Экономит тригонометрию в каждой колонке.
-    /// </summary>
-    private void PrepareRowCaches()
+    /// <summary>Маленький прицел в центре вида: светлая точка с тёмной обводкой.</summary>
+    private static void DrawCrosshair(Framebuffer framebuffer, Viewport viewport)
     {
-        if (_floorRowDistance.Length < _pixelRows)
+        int cx = viewport.Columns / 2, cy = viewport.PixelRows / 2;
+        int size = Math.Max(1, viewport.PixelRows / 120);
+
+        for (int dy = -size - 1; dy <= size; dy++)
+        for (int dx = -size - 1; dx <= size; dx++)
         {
-            _floorRowDistance = new double[_pixelRows];
-            _ceilingRowDistance = new double[_pixelRows];
-            _floorBrightness = new double[_pixelRows];
-            _ceilingBrightness = new double[_pixelRows];
-            _skyTexV = new double[_pixelRows];
-        }
+            bool core = dx >= -size && dx < size && dy >= -size && dy < size;
+            bool cross = (dx >= -size && dx < size) || (dy >= -size && dy < size);
+            if (!cross)
+                continue;
 
-        double focal = _viewport.FocalPixels;
-
-        for (int pixel = 0; pixel < _pixelRows; pixel++)
-        {
-            double belowHorizon = pixel + 0.5 - _horizon;
-            double aboveHorizon = _horizon - (pixel + 0.5);
-
-            // Пол/потолок на высоте камеры (0.5): строка экрана <-> перпендикулярная дистанция.
-            double floorDistance = belowHorizon > 0.5 ? 0.5 * _pixelRows / belowHorizon : 1e30;
-            double ceilingDistance = aboveHorizon > 0.5 ? 0.5 * _pixelRows / aboveHorizon : 1e30;
-
-            _floorRowDistance[pixel] = Math.Min(floorDistance, MaxSurfaceDistance);
-            _ceilingRowDistance[pixel] = Math.Min(ceilingDistance, MaxSurfaceDistance);
-            _floorBrightness[pixel] = BrightnessAt(_floorRowDistance[pixel]);
-            _ceilingBrightness[pixel] = BrightnessAt(_ceilingRowDistance[pixel]);
-
-            // Небо: вертикальный угол над горизонтом -> V экваторасибо текстуры.
-            // Панорама занимает ВЕРХНЮЮ половину картинки: зенит сверху, горизонт в середине.
-            double verticalAngle = Math.Atan(aboveHorizon / focal);
-            double v = 0.5 * (1.0 - verticalAngle / (Math.PI / 2.0));
-            _skyTexV[pixel] = Math.Clamp(v, 0.0, 0.5);
+            Plot(framebuffer, cx + dx, cy + dy, core ? 0xF0F0E0 : 0x101010);
         }
     }
 
-    private static double BrightnessAt(double distance)
+    private static void Plot(Framebuffer framebuffer, int x, int pixel, int color)
     {
-        double brightness = LightRange / (distance + LightOffset);
-        if (brightness > 1) brightness = 1;
-        if (brightness < MinBrightness) brightness = MinBrightness;
-        return Math.Pow(brightness, Gamma);
-    }
-
-    /// <summary>Точка входа для Parallel.For: читает контекст кадра из полей.</summary>
-    private void RenderColumnFromContext(int x) => RenderColumn(x);
-
-    /// <summary>Трассирует колонку: небо/потолок, пол, стеновые сегменты, затем спрайты.</summary>
-    private void RenderColumn(int x)
-    {
-        Framebuffer framebuffer = _frameBuffer;
-        Viewport viewport = _viewport;
-        Player player = _player;
-
-        char[] chars = framebuffer.Chars;
-        int[] foreground = framebuffer.Foreground;
-        int[] background = framebuffer.Background;
-
-        double rayAngle = player.Angle - viewport.HalfFieldOfViewRadians
-                          + viewport.FieldOfViewRadians * ((x + 0.5) / viewport.Columns);
-        double rayDirX = Math.Cos(rayAngle);
-        double rayDirY = Math.Sin(rayAngle);
-
-        Span<WallHit> hits = stackalloc WallHit[GameConfig.MaxWallHitsPerRay];
-        int hitCount = Raycaster.CastAll(_level, player.X, player.Y, rayAngle, hits);
-
-        // 1. Пол и потолок/небо на всю колонку — стены лягут поверх.
-        // ВАЖНО: дистанцией пола/потолка считаем ПЕРПЕНДИКУЛЯРНУЮ (как у стен), без поправки
-        // на «рыбий глаз». Иначе у краёв экрана потолок/пол перестают сходиться со стенами:
-        // между крышей и стеной пролезает небо, пол «отрывается» от стен эллипсом.
-        for (int y = 0; y < viewport.Rows; y++)
-        {
-            int index = y * viewport.Columns + x;
-            chars[index] = Framebuffer.UpperHalfBlock;
-
-            int topPixel = y * 2;
-            int bottomPixel = y * 2 + 1;
-
-            foreground[index] = topPixel + 0.5 < _horizon
-                ? CeilingOrSky(topPixel, rayAngle, rayDirX, rayDirY)
-                : FloorAtPixel(topPixel, rayDirX, rayDirY);
-
-            background[index] = bottomPixel + 0.5 < _horizon
-                ? CeilingOrSky(bottomPixel, rayAngle, rayDirX, rayDirY)
-                : FloorAtPixel(bottomPixel, rayDirX, rayDirY);
-        }
-
-        // 2. Стены от дальних к ближним: низкая стена не закрывает то, что за ней.
-        // Границы сегментов — локальные для колонки (рендер параллельный!).
-        Span<double> slabDistance = stackalloc double[GameConfig.MaxWallHitsPerRay];
-        Span<double> slabTop = stackalloc double[GameConfig.MaxWallHitsPerRay];
-        Span<double> slabBottom = stackalloc double[GameConfig.MaxWallHitsPerRay];
-        int slabCount = 0;
-
-        for (int hitIndex = hitCount - 1; hitIndex >= 0; hitIndex--)
-        {
-            WallHit hit = hits[hitIndex];
-            double screenTop = _horizon + _pixelRows * (0.5 - hit.Height) / hit.Distance;
-            double screenBottom = _horizon + _pixelRows * 0.5 / hit.Distance;
-
-            PaintWallSlab(x, hit, screenTop, screenBottom);
-
-            if (slabCount < GameConfig.MaxWallHitsPerRay)
-            {
-                slabDistance[slabCount] = hit.Distance;
-                slabTop[slabCount] = screenTop;
-                slabBottom[slabCount] = screenBottom;
-                slabCount++;
-            }
-        }
-
-        // 3. Спрайты перед стенами этой колонки.
-        if (_spriteCount == 0)
+        if (x < 0 || x >= framebuffer.Columns || pixel < 0 || pixel >= framebuffer.Rows * 2)
             return;
 
-        for (int spriteIndex = 0; spriteIndex < _spriteCount; spriteIndex++)
-        {
-            SpriteQuad sprite = _spriteCache[spriteIndex];
-
-            if (x + 0.5 < sprite.MinX || x + 0.5 > sprite.MaxX)
-                continue;
-
-            if (sprite.Texture is not null)
-                RenderTexturedSpriteColumn(x, sprite, slabDistance, slabTop, slabBottom, slabCount);
-            else
-                RenderColoredSpriteColumn(x, sprite, slabDistance, slabTop, slabBottom, slabCount);
-        }
-    }
-
-    // ============================================================
-    //   Пол, потолок и небо
-    // ============================================================
-
-    /// <summary>Цвет пола в «пикселе»: текстура по мировым координатам с затенением по дистанции.</summary>
-    private int FloorAtPixel(int pixel, double rayDirX, double rayDirY)
-    {
-        double rowDistance = _floorRowDistance[pixel];
-        double brightness = _floorBrightness[pixel];
-
-        double worldX = _player.X + rayDirX * rowDistance;
-        double worldY = _player.Y + rayDirY * rowDistance;
-
-        int floorType = _level.FloorAt((int)worldX, (int)worldY);
-        (int baseR, int baseG, int baseB) = WallPalette.GetBaseColor(floorType);
-
-        Texture? texture = FloorTexture(floorType);
-        if (texture is null)
-            return ColorRgb.Pack((int)(baseR * brightness), (int)(baseG * brightness), (int)(baseB * brightness));
-
-        int texX = TextureX(worldX, texture);
-        int texY = TextureX(worldY, texture);
-        int argb = texture.SamplePixel(texX, texY);
-
-        if (Texture.IsTransparent(argb))
-            return ColorRgb.Pack((int)(baseR * brightness), (int)(baseG * brightness), (int)(baseB * brightness));
-
-        return ColorRgb.Pack(
-            (int)(((argb >>> 16) & 0xFF) * brightness),
-            (int)(((argb >>> 8) & 0xFF) * brightness),
-            (int)((argb & 0xFF) * brightness));
-    }
-
-    private Texture? FloorTexture(int floorType) =>
-        floorType < _floorTextureCache.Length
-            ? _floorTextureCache[floorType] ??= Assets?.GetFloor(floorType)
-            : Assets?.GetFloor(floorType);
-
-    /// <summary>
-    ///     Цвет над горизонтом: если над точкой потолок — его текстура, если нет — небо.
-    ///     Так из окна здания видно небо, а изнутри — потолок в стиле стен.
-    /// </summary>
-    private int CeilingOrSky(int pixel, double rayAngle, double rayDirX, double rayDirY)
-    {
-        double rowDistance = _ceilingRowDistance[pixel];
-        double brightness = _ceilingBrightness[pixel];
-
-        double worldX = _player.X + rayDirX * rowDistance;
-        double worldY = _player.Y + rayDirY * rowDistance;
-
-        int ceilingType = _level.CeilingAt((int)worldX, (int)worldY);
-        if (ceilingType == 0)
-            return SkyAtPixel(pixel, rayAngle);
-
-        (int baseR, int baseG, int baseB) = WallPalette.GetBaseColor(ceilingType);
-
-        // Потолок — текстурой стены здания.
-        Texture? texture = CeilingTexture(ceilingType);
-        if (texture is null)
-            return ColorRgb.Pack((int)(baseR * brightness), (int)(baseG * brightness), (int)(baseB * brightness));
-
-        int texX = TextureX(worldX, texture);
-        int texY = TextureX(worldY, texture);
-        int argb = texture.SamplePixel(texX, texY);
-
-        if (Texture.IsTransparent(argb))
-            return ColorRgb.Pack((int)(baseR * brightness), (int)(baseG * brightness), (int)(baseB * brightness));
-
-        return ColorRgb.Pack(
-            (int)(((argb >>> 16) & 0xFF) * brightness),
-            (int)(((argb >>> 8) & 0xFF) * brightness),
-            (int)((argb & 0xFF) * brightness));
-    }
-
-    private Texture? CeilingTexture(int ceilingType) =>
-        ceilingType < _ceilingTextureCache.Length
-            ? _ceilingTextureCache[ceilingType] ??= Assets?.GetWall(ceilingType)
-            : Assets?.GetWall(ceilingType);
-
-    private Texture? WallTexture(int wallType) =>
-        wallType < _wallTextureCache.Length
-            ? _wallTextureCache[wallType] ??= Assets?.GetWall(wallType)
-            : Assets?.GetWall(wallType);
-
-    /// <summary>Цвет неба: 360° панорама по углу луча, по вертикали — наклон камеры.</summary>
-    private int SkyAtPixel(int pixel, double rayAngle)
-    {
-        Texture? skybox = _skyboxTexture;
-
-        if (skybox is null)
-            return EnvironmentPalette.SkyColor(pixel, _pixelRows);
-
-        double u = rayAngle / Math.Tau;
-        u -= Math.Floor(u);
-
-        int texX = Math.Clamp((int)(u * skybox.Width), 0, skybox.Width - 1);
-        int texY = Math.Clamp((int)(_skyTexV[pixel] * skybox.Height), 0, skybox.Height - 1);
-
-        int argb = skybox.SamplePixel(texX, texY);
-
-        // Чёрная половина панорамы не должна попасть в кадр.
-        return Texture.IsTransparent(argb) || (argb & 0xFFFFFF) == 0
-            ? EnvironmentPalette.SkyColor(pixel, _pixelRows)
-            : argb | unchecked((int)0xFF000000);
-    }
-
-    private static int TextureX(double worldCoordinate, Texture texture) =>
-        Math.Clamp((int)((worldCoordinate - Math.Floor(worldCoordinate)) * texture.Width), 0, texture.Width - 1);
-
-    // ============================================================
-    //   Стены (сегменты произвольной высоты, от дальних к ближним)
-    // ============================================================
-
-    private void PaintWallSlab(int x, WallHit hit, double screenTop, double screenBottom)
-    {
-        Framebuffer framebuffer = _frameBuffer;
-        Viewport viewport = _viewport;
-
-        char[] chars = framebuffer.Chars;
-        int[] foreground = framebuffer.Foreground;
-        int[] background = framebuffer.Background;
-
-        double distance = hit.Distance;
-
-        (int baseR, int baseG, int baseB) = WallPalette.GetBaseColor(Level.WallTypeOf(hit.TileType));
-        Texture? wallTexture = WallTexture(Level.WallTypeOf(hit.TileType));
-
-        var shader = new WallShader.ColumnShader(baseR, baseG, baseB, wallTexture, distance, hit.Side, hit.WallX);
-        double scale = distance / _pixelRows;
-
-        for (int y = 0; y < viewport.Rows; y++)
-        {
-            int topPixel = y * 2;
-            int bottomPixel = y * 2 + 1;
-
-            double topCoverage = PixelCoverage(topPixel, screenTop, screenBottom);
-            double bottomCoverage = PixelCoverage(bottomPixel, screenTop, screenBottom);
-            if (topCoverage <= 0 && bottomCoverage <= 0)
-                continue;
-
-            int index = y * viewport.Columns + x;
-            chars[index] = Framebuffer.UpperHalfBlock;
-
-            // Мировая высота краёв пикселя: кирпичи «продолжаются» по стенам любой высоты.
-            if (topCoverage > 0)
-            {
-                int color = shader.ShadeSpan(
-                    1.0 - WorldZAt(topPixel, scale),
-                    1.0 - WorldZAt(topPixel + 1, scale));
-
-                foreground[index] = topCoverage >= 1
-                    ? color
-                    : ColorRgb.Blend(foreground[index], color, topCoverage);
-            }
-
-            if (bottomCoverage > 0)
-            {
-                int color = shader.ShadeSpan(
-                    1.0 - WorldZAt(bottomPixel, scale),
-                    1.0 - WorldZAt(bottomPixel + 1, scale));
-
-                background[index] = bottomCoverage >= 1
-                    ? color
-                    : ColorRgb.Blend(background[index], color, bottomCoverage);
-            }
-        }
-    }
-
-    /// <summary>Мировая высота точки экрана на стене с данной дистанцией (0 — пол, 1 — потолок уровня).</summary>
-    private double WorldZAt(int pixel, double scale) => 0.5 - (pixel - _horizon) * scale;
-
-    // ============================================================
-    //   Спрайты
-    // ============================================================
-
-    /// <summary>Пиксель спрайта закрыт стеной этой колонки, стоящей ближе?</summary>
-    private static bool HiddenByWall(
-        ReadOnlySpan<double> slabDistance,
-        ReadOnlySpan<double> slabTop,
-        ReadOnlySpan<double> slabBottom,
-        int slabCount,
-        int pixel,
-        double spriteDistance)
-    {
-        for (int slab = 0; slab < slabCount; slab++)
-        {
-            if (slabDistance[slab] < spriteDistance - 0.01
-                && pixel + 0.5 >= slabTop[slab]
-                && pixel + 0.5 <= slabBottom[slab])
-                return true;
-        }
-
-        return false;
-    }
-
-    private void RenderColoredSpriteColumn(
-        int x,
-        SpriteQuad sprite,
-        ReadOnlySpan<double> slabDistance,
-        ReadOnlySpan<double> slabTop,
-        ReadOnlySpan<double> slabBottom,
-        int slabCount)
-    {
-        Framebuffer framebuffer = _frameBuffer;
-        Viewport viewport = _viewport;
-
-        char[] chars = framebuffer.Chars;
-        int[] foreground = framebuffer.Foreground;
-        int[] background = framebuffer.Background;
-
-        for (int y = 0; y < viewport.Rows; y++)
-        {
-            int topPixel = y * 2;
-            int bottomPixel = y * 2 + 1;
-
-            bool topHidden = HiddenByWall(slabDistance, slabTop, slabBottom, slabCount, topPixel,
-                sprite.PerpendicularDistance);
-            bool bottomHidden = HiddenByWall(slabDistance, slabTop, slabBottom, slabCount, bottomPixel,
-                sprite.PerpendicularDistance);
-
-            if (topHidden && bottomHidden)
-                continue;
-
-            double topCoverage = PixelCoverage(topPixel, sprite.TopY, sprite.BottomY);
-            double bottomCoverage = PixelCoverage(bottomPixel, sprite.TopY, sprite.BottomY);
-            if (topCoverage <= 0 && bottomCoverage <= 0)
-                continue;
-
-            int index = y * viewport.Columns + x;
-            chars[index] = Framebuffer.UpperHalfBlock;
-
-            if (topCoverage > 0 && !topHidden)
-            {
-                double alpha = topCoverage * sprite.Alpha;
-                foreground[index] = alpha >= 1
-                    ? sprite.Color
-                    : ColorRgb.Blend(foreground[index], sprite.Color, alpha);
-            }
-
-            if (bottomCoverage > 0 && !bottomHidden)
-            {
-                double alpha = bottomCoverage * sprite.Alpha;
-                background[index] = alpha >= 1
-                    ? sprite.Color
-                    : ColorRgb.Blend(background[index], sprite.Color, alpha);
-            }
-        }
-    }
-
-    /// <summary>Колонка текстурированного спрайта: сэмплы по UV с затенением и альфой.</summary>
-    private void RenderTexturedSpriteColumn(
-        int x,
-        SpriteQuad sprite,
-        ReadOnlySpan<double> slabDistance,
-        ReadOnlySpan<double> slabTop,
-        ReadOnlySpan<double> slabBottom,
-        int slabCount)
-    {
-        Framebuffer framebuffer = _frameBuffer;
-        Viewport viewport = _viewport;
-        Texture texture = sprite.Texture!;
-
-        double quadWidth = sprite.MaxX - sprite.MinX;
-        double quadHeight = sprite.BottomY - sprite.TopY;
-
-        if (quadWidth <= 0.001 || quadHeight <= 0.001)
-            return;
-
-        double u = (x + 0.5 - sprite.MinX) / quadWidth;
-        int texX = Math.Clamp((int)(u * texture.Width), 0, texture.Width - 1);
-
-        char[] chars = framebuffer.Chars;
-        int[] foreground = framebuffer.Foreground;
-        int[] background = framebuffer.Background;
-
-        for (int y = 0; y < viewport.Rows; y++)
-        {
-            int topPixel = y * 2;
-            int bottomPixel = y * 2 + 1;
-
-            bool topHidden = HiddenByWall(slabDistance, slabTop, slabBottom, slabCount, topPixel,
-                sprite.PerpendicularDistance);
-            bool bottomHidden = HiddenByWall(slabDistance, slabTop, slabBottom, slabCount, bottomPixel,
-                sprite.PerpendicularDistance);
-
-            if (topHidden && bottomHidden)
-                continue;
-
-            double topCoverage = PixelCoverage(topPixel, sprite.TopY, sprite.BottomY);
-            double bottomCoverage = PixelCoverage(bottomPixel, sprite.TopY, sprite.BottomY);
-            if (topCoverage <= 0 && bottomCoverage <= 0)
-                continue;
-
-            int index = y * viewport.Columns + x;
-            chars[index] = Framebuffer.UpperHalfBlock;
-
-            if (topCoverage > 0 && !topHidden)
-            {
-                int argb = SampleSprite(texture, texX, topPixel, sprite.TopY, quadHeight);
-                if (!Texture.IsTransparent(argb))
-                {
-                    double alpha = topCoverage * sprite.Alpha * ((argb >>> 24) / 255.0);
-                    int color = ShadeSpritePixel(argb, sprite.Brightness);
-                    foreground[index] = alpha >= 1
-                        ? color
-                        : ColorRgb.Blend(foreground[index], color, alpha);
-                }
-            }
-
-            if (bottomCoverage > 0 && !bottomHidden)
-            {
-                int argb = SampleSprite(texture, texX, bottomPixel, sprite.TopY, quadHeight);
-                if (!Texture.IsTransparent(argb))
-                {
-                    double alpha = bottomCoverage * sprite.Alpha * ((argb >>> 24) / 255.0);
-                    int color = ShadeSpritePixel(argb, sprite.Brightness);
-                    background[index] = alpha >= 1
-                        ? color
-                        : ColorRgb.Blend(background[index], color, alpha);
-                }
-            }
-        }
-    }
-
-    private static int SampleSprite(Texture texture, int texX, int pixelY, double quadTop, double quadHeight)
-    {
-        double v = (pixelY + 0.5 - quadTop) / quadHeight;
-        int texY = Math.Clamp((int)(v * texture.Height), 0, texture.Height - 1);
-        return texture.SamplePixel(texX, texY);
-    }
-
-    private static int ShadeSpritePixel(int argb, double brightness)
-    {
-        int r = Math.Clamp((int)(((argb >>> 16) & 0xFF) * brightness), 0, 255);
-        int g = Math.Clamp((int)(((argb >>> 8) & 0xFF) * brightness), 0, 255);
-        int b = Math.Clamp((int)((argb & 0xFF) * brightness), 0, 255);
-        return ColorRgb.Pack(r, g, b);
-    }
-
-    /// <summary>Доля «пикселя», попавшая в вертикальный отрезок (сглаживание краёв).</summary>
-    private static double PixelCoverage(int pixel, double top, double bottom)
-    {
-        double overlap = Math.Min(bottom, pixel + 1.0) - Math.Max(top, (double)pixel);
-        return overlap <= 0 ? 0 : Math.Min(overlap, 1.0);
+        int index = (pixel >> 1) * framebuffer.Columns + x;
+        ((pixel & 1) == 0 ? framebuffer.Foreground : framebuffer.Background)[index] = color;
+        framebuffer.Chars[index] = Framebuffer.UpperHalfBlock;
     }
 }

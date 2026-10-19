@@ -20,11 +20,11 @@ internal sealed class DoomGame
     private readonly MouseState _mouse = new();
     private readonly ConsoleInputSource _input = new();
     private readonly MenuController _menu = new();
-    private readonly Level _level = Level.CreateDefault();
     private readonly Player _player = new();
     private readonly List<Pickup> _pickups = new();
     private readonly ProjectileSystem _projectiles = new();
     private readonly ConsolePresenter _presenter;
+    private readonly FramePipeline _pipeline;
     private readonly Stopwatch _totalTimer = new();
     private readonly Stopwatch _frameTimer = new();
 
@@ -33,6 +33,15 @@ internal sealed class DoomGame
 
     /// <summary>Файл диагностики уже создан за этот запуск (первая строка перезаписывает старый).</summary>
     private static bool _diagnosticsStarted;
+
+    /// <summary>Текущая карта (assets/maps/house.map; без файла — запасная коробка).</summary>
+    private Level _level = FallbackLevel();
+
+    /// <summary>Последний кадр нарисован упрощённым (в движении): в покое его надо перерисовать начисто.</summary>
+    private bool _lastFrameSimplified;
+
+    /// <summary>Фаза мигания черепа-указателя в меню: меню перерисовывается при её смене.</summary>
+    private int _menuBlinkPhase;
 
     private Framebuffer _framebuffer = new(1, 1);
     private Viewport _viewport;
@@ -50,27 +59,37 @@ internal sealed class DoomGame
     /// <summary>Меню ждёт перерисовки (открытие, движение мыши, изменение настроек).</summary>
     private bool _menuDirty;
 
-    /// <summary>Сглаженное значение FPS для счётчика в строке состояния.</summary>
+    /// <summary>
+    ///     FPS для счётчика в строке состояния: сколько кадров реально дошло до терминала
+    ///     за последние полсекунды (а не сколько раз провернулся цикл).
+    /// </summary>
     private double _fps;
 
-    // Адаптивный темп презентации: см. PresentIfTerminalKeptUp.
-    private const double PresentCostCapMs = 10.0;
-    private const double PresentIntervalFactor = 1.2;
-    private double _presentCostMs;
-    private long _lastPresentTick = long.MinValue;
+    private long _fpsWindowStartTick;
+    private long _fpsWindowStartFrames;
+
+    /// <summary>Окно игры на переднем плане (опрашивается раз в кадр).</summary>
+    private bool _hasFocus = true;
+
+    /// <summary>Невидимая «шторка» под курсором: прячет его и не даёт мыши выделять текст терминала.</summary>
+    private CursorShield? _shield;
 
     public DoomGame()
     {
         _assets = new AssetStore();
         _renderer = new SceneRenderer(_assets);
         _presenter = new ConsolePresenter(_terminal, Terminal.IsRunningInWindowsTerminal);
-        _pickups.AddRange(PickupLayout.CreateDefault());
+        _pipeline = new FramePipeline(_presenter);
     }
 
     public void Run()
     {
         GameSettings.Load();
         _assets.Load();
+        _level = LoadLevel(_assets, "maps/town.map");
+        _shield = OperatingSystem.IsWindows() ? new CursorShield() : null;
+        _mouse.Shield = _shield;
+        RestartLevel();
 
         if (!PrepareTerminal())
             return;
@@ -100,20 +119,38 @@ internal sealed class DoomGame
         _frameTimer.Restart();
         _previousFrameTime = _totalTimer.Elapsed.TotalSeconds;
 
+        // Точный системный таймер: без него Thread.Sleep(5) спит ~15.6 мс, и цикл не мог
+        // держать 60 кадров — картинка и ввод шли рывками.
+        bool fineTimer = OperatingSystem.IsWindows() && NativeMethods.timeBeginPeriod(1) == 0;
+
         try
         {
             Loop();
         }
         finally
         {
+            // Сначала дожидаемся, пока уйдёт последний кадр: иначе он мог бы лечь
+            // поверх восстановленного экрана терминала.
+            _pipeline.Dispose();
+
+            if (fineTimer)
+                NativeMethods.timeEndPeriod(1);
+
             GameSettings.Current.Save();
             _assets.Dispose();
-            _mouse.EndCapture();
-            _terminal.DisableMouseReporting();
-            _terminal.EnableAutoWrap();
-            _terminal.RestoreInputMode();
-            _terminal.Restore();
+            _shield?.Dispose();
+            RestoreTerminal();
         }
+    }
+
+    /// <summary>Возвращает терминал и курсор в обычное состояние (выход или Ctrl+C).</summary>
+    private void RestoreTerminal()
+    {
+        _mouse.EndCapture();
+        _terminal.DisableMouseReporting();
+        _terminal.EnableAutoWrap();
+        _terminal.RestoreInputMode();
+        _terminal.Restore();
     }
 
     /// <summary>
@@ -212,27 +249,99 @@ internal sealed class DoomGame
         return true;
     }
 
-    /// <summary>Пересоздаёт буферы кадра под новый размер окна.</summary>
-    private void Resize(int columns, int rows)
+    /// <summary>
+    ///     Пересоздаёт буферы кадра под новый размер окна. Делается, пока поток вывода
+    ///     простаивает: недоотправленный кадр старого размера выбрасывается.
+    /// </summary>
+    private void Resize(int columns, int rows, bool clearScreen = false)
     {
         _framebuffer = new Framebuffer(columns, rows);
-        _viewport = new Viewport(columns, rows);
-        _presenter.EnsureCapacity(columns * rows);
-        _presenter.Reset();
+        _viewport = CreateViewport();
+        MenuController.ViewSize = (_viewport.Columns, _viewport.PixelRows);
 
-        // Буфер консоли выравниваем по рамке: вывод в нижнюю строку окна не должен
-        // прокручивать буфер — иначе кадр «размазывается» и уходит за рамку.
-        _terminal.SyncBufferToWindow();
+        _pipeline.Exclusive(presenter =>
+        {
+            presenter.EnsureCapacity(columns * rows);
+
+            if (clearScreen)
+                _terminal.ClearScreen();
+
+            // Буфер консоли выравниваем по рамке: вывод в нижнюю строку окна не должен
+            // прокручивать буфер — иначе кадр «размазывается» и уходит за рамку.
+            _terminal.SyncBufferToWindow();
+        });
     }
+
+    /// <summary>Вид — всё, что над строкой состояния (её высота зависит от размера окна).</summary>
+    private Viewport CreateViewport()
+    {
+        int hudRows = _renderer.Hud.RowsFor(_framebuffer.Columns, _framebuffer.Rows);
+        return new Viewport(_framebuffer.Columns, Math.Max(1, _framebuffer.Rows - hudRows));
+    }
+
+    /// <summary>Загружает карту из ассетов; при ошибке — запасной уровень и строка в лог.</summary>
+    private static Level LoadLevel(AssetStore assets, string path)
+    {
+        string? text = assets.ReadText(path);
+        if (text is null)
+        {
+            LogDiagnostics($"[doom] карта {path} не найдена — запасной уровень");
+            return FallbackLevel();
+        }
+
+        try
+        {
+            return MapLoader.Parse(text, TextureMetrics.Parse(assets.ReadText("textures/textures.txt")));
+        }
+        catch (Exception exception) when (exception is FormatException or ArgumentException or InvalidOperationException
+                                              or IndexOutOfRangeException or KeyNotFoundException)
+        {
+            LogDiagnostics($"[doom] карта {path} не читается: {exception.Message} — запасной уровень");
+            return FallbackLevel();
+        }
+    }
+
+    /// <summary>Запасной уровень: пустая комната, чтобы игра запускалась даже без assets/.</summary>
+    private static Level FallbackLevel() => MapLoader.Parse("""
+        [map]
+        name = Запасная комната
+        start = 4.5 4.5 -90
+        [walls]
+        B = brick_red
+        [floors]
+        f = concrete
+        [ceilings]
+        c = ceiling_plaster
+        [grid walls]
+        BBBBBBBBB
+        B       B
+        B       B
+        B       B
+        B       B
+        B       B
+        BBBBBBBBB
+        [grid floors]
+        fffffffff
+        fffffffff
+        fffffffff
+        fffffffff
+        fffffffff
+        fffffffff
+        fffffffff
+        [grid ceilings]
+        ccccccccc
+        ccccccccc
+        ccccccccc
+        ccccccccc
+        ccccccccc
+        ccccccccc
+        ccccccccc
+        """);
 
     private void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs args)
     {
         args.Cancel = false;
-        _mouse.EndCapture();
-        _terminal.DisableMouseReporting();
-        _terminal.EnableAutoWrap();
-        _terminal.RestoreInputMode();
-        _terminal.Restore();
+        _pipeline.Exclusive(_ => RestoreTerminal());
     }
 
     /// <summary>Читает одно нажатие клавиши: из событий консоли или напрямую (не-Windows).</summary>
@@ -315,10 +424,10 @@ internal sealed class DoomGame
                     break;
 
                 case ConsoleKey.Q:
-                    _player.CycleWeapon(-1, nowSeconds);
+                    _player.CycleWeapon(1, nowSeconds);
                     break;
                 case ConsoleKey.E:
-                    _player.CycleWeapon(1, nowSeconds);
+                    UseDoor();
                     break;
                 case ConsoleKey.R:
                     RestartLevel();
@@ -332,10 +441,10 @@ internal sealed class DoomGame
     /// <summary>Возвращает игрока в начало уровня и раскладывает бонусы заново.</summary>
     private void RestartLevel()
     {
-        _player.Reset();
+        _player.Reset(_level);
         _projectiles.Reset();
         _pickups.Clear();
-        _pickups.AddRange(PickupLayout.CreateDefault());
+        _pickups.AddRange(_level.CreatePickups());
         _shotCounter = 0;
     }
 
@@ -343,11 +452,10 @@ internal sealed class DoomGame
     private bool TryApplyWindowSize()
     {
         Terminal.ReadWindowSize(out int columns, out int rows);
-        if (columns == _viewport.Columns && rows == _viewport.Rows)
+        if (columns == _framebuffer.Columns && rows == _framebuffer.Rows)
             return false;
 
-        Resize(columns, rows);
-        _terminal.ClearScreen();
+        Resize(columns, rows, clearScreen: true);
         return true;
     }
 
@@ -356,6 +464,8 @@ internal sealed class DoomGame
         double lastX = double.NaN;
         double lastY = double.NaN;
         double lastAngle = double.NaN;
+        double lastPitch = double.NaN;
+        double lastEye = double.NaN;
         bool hasRendered = false;
 
         while (!_quitRequested)
@@ -373,107 +483,121 @@ internal sealed class DoomGame
             long nowMs = Environment.TickCount64;
             double nowSeconds = nowMs / 1000.0;
 
-            _mouse.Update();
+            // Клавиши и кнопки опрашиваются глобально, поэтому без фокуса игра их не слушает.
+            bool hadFocus = _hasFocus;
+            _hasFocus = _terminal.IsForeground();
+            if (_hasFocus != hadFocus)
+                hasRendered = false;
+
+            _mouse.HideCursor = GameSettings.Current.HideCursor;
+            _mouse.Update(_hasFocus && _screen == GameScreen.Playing);
 
             // Забираем клавиши и мышь из очереди событий консоли (клавиатура меню,
             // мышь меню, Esc во время игры — всё приходит отсюда) и применяем
             // изменения ассетов: перекрашенный в редакторе PNG подхватывается на лету.
             _input.Poll();
-            _assets.Poll();
+            if (_assets.Poll())
+                hasRendered = false;
 
             if (_screen == GameScreen.Playing)
                 HandleGameKeys(nowMs);
 
             bool redraw;
+            MotionDetail motion = MotionDetail.Full;
 
             if (_screen == GameScreen.Playing)
             {
                 double elapsedSeconds = _totalTimer.Elapsed.TotalSeconds;
-                double deltaSeconds = elapsedSeconds - _previousFrameTime;
+                double deltaSeconds = Math.Clamp(elapsedSeconds - _previousFrameTime, 0, GameConfig.MaxFrameSeconds);
                 _previousFrameTime = elapsedSeconds;
-
-                if (deltaSeconds > GameConfig.MaxFrameSeconds)
-                    deltaSeconds = GameConfig.MaxFrameSeconds;
-                if (deltaSeconds < 0)
-                    deltaSeconds = 0;
 
                 bool anyInput = UpdateWorld(deltaSeconds, nowSeconds, nowMs);
 
-                bool positionChanged = _player.X != lastX || _player.Y != lastY || _player.Angle != lastAngle;
+                bool positionChanged = _player.X != lastX || _player.Y != lastY
+                                       || _player.Angle != lastAngle || _player.Pitch != lastPitch
+                                       || _player.EyeZ != lastEye;
                 bool animationRunning =
                     nowSeconds - _player.LastFireTime < GameConfig.WeaponAnimationSeconds ||
                     nowSeconds < _player.MuzzleFlashUntil ||
                     _player.IsRaisingWeapon(nowSeconds) ||
                     _player.BobIntensity > 0.001 ||
-                    _projectiles.IsActive;
+                    _projectiles.IsActive ||
+                    !_player.OnGround ||
+                    _level.Doors.Any(door => door.IsMoving);
 
-                redraw = !hasRendered || anyInput || positionChanged || animationRunning;
+                // Остановились после движения — кадр перерисовывается в полном качестве.
+                bool settled = _lastFrameSimplified && !positionChanged;
+                redraw = !hasRendered || anyInput || positionChanged || animationRunning || settled;
+                motion = positionChanged && hasRendered ? MotionDetailNow() : MotionDetail.Full;
 
                 if (redraw)
                 {
                     lastX = _player.X;
                     lastY = _player.Y;
                     lastAngle = _player.Angle;
+                    lastPitch = _player.Pitch;
+                    lastEye = _player.EyeZ;
                 }
             }
             else
             {
-                // Меню перерисовывается по событиям: открытие, клавиши, движение мыши.
+                // Меню перерисовывается по событиям (открытие, клавиши, мышь) и когда мигает череп.
                 bool menuChanged = ProcessMenuInput();
-                redraw = !hasRendered || menuChanged || _menuDirty;
+                int blinkPhase = (int)(nowSeconds / 0.3);
+                bool blink = blinkPhase != _menuBlinkPhase;
+                _menuBlinkPhase = blinkPhase;
+                redraw = !hasRendered || menuChanged || _menuDirty || blink;
                 _menuDirty = false;
             }
 
+            UpdateFpsCounter();
+
             if (redraw)
             {
-                RenderFrame(nowSeconds);
-                PresentIfTerminalKeptUp();
-                hasRendered = true;
-            }
+                RenderFrame(nowSeconds, motion);
+                _lastFrameSimplified = motion != MotionDetail.Full;
 
-            double frameSeconds = _frameTimer.Elapsed.TotalSeconds;
-            if (frameSeconds > 0.0001)
-            {
-                double instantFps = 1.0 / frameSeconds;
-                _fps = _fps <= 0 ? instantFps : _fps * 0.9 + instantFps * 0.1;
+                // Кадр уходит в терминал отдельным потоком: цикл не ждёт медленный терминал.
+                _pipeline.Submit(_framebuffer);
+                hasRendered = true;
             }
 
             SleepToTargetFrameRate();
         }
     }
 
-    /// <summary>
-    ///     Отправляет кадр терминалу, но не чаще, чем он успевает отрисовывать.
-    ///     Длительность записи в stdout (включая блокировку о переполнении трубы —
-    ///     терминал не поспевает) сглаживается в _presentCostMs; при больших кадрах
-    ///     это задаёт минимальный интервал между отправками. Пропуск отправки
-    ///     безопасен: фреймбуфер всегда хранит самый свежий кадр, а снимок
-    ///     презентера соответствует содержимому терминала.
-    /// </summary>
-    private void PresentIfTerminalKeptUp()
+    /// <summary>Пересчитывает FPS по числу кадров, реально отправленных в терминал.</summary>
+    private void UpdateFpsCounter()
     {
-        long nowTick = Environment.TickCount64;
+        long nowTick = Stopwatch.GetTimestamp();
+        long frames = _pipeline.PresentedFrames;
 
-        if (_lastPresentTick != long.MinValue)
+        if (_fpsWindowStartTick == 0)
         {
-            double minIntervalMs = _presentCostMs > PresentCostCapMs
-                ? _presentCostMs * PresentIntervalFactor
-                : 0;
-
-            if (nowTick - _lastPresentTick < minIntervalMs)
-                return; // терминал занят предыдущим кадром — покажем следующий
+            _fpsWindowStartTick = nowTick;
+            _fpsWindowStartFrames = frames;
+            return;
         }
 
-        long start = nowTick;
-        _presenter.Present(_framebuffer);
-        long cost = Environment.TickCount64 - start;
+        double seconds = (nowTick - _fpsWindowStartTick) / (double)Stopwatch.Frequency;
+        if (seconds < 0.5)
+            return;
 
-        _presentCostMs = _presentCostMs <= 0 ? cost : _presentCostMs * 0.8 + cost * 0.2;
-        _lastPresentTick = nowTick;
+        _fps = (frames - _fpsWindowStartFrames) / seconds;
+        _fpsWindowStartTick = nowTick;
+        _fpsWindowStartFrames = frames;
     }
 
+    /// <summary>
+    ///     Насколько упростить кадр в движении. Упрощение включено всегда — это оптимизация
+    ///     (в движении мелочи не разглядеть, а терминалу уходит заметно меньше данных);
+    ///     галка «Грубее в движении» делает его сильнее.
+    /// </summary>
+    private static MotionDetail MotionDetailNow() =>
+        GameSettings.Current.StrongMotionSimplify ? MotionDetail.Strong : MotionDetail.Soft;
+
     /// <summary>Рисует кадр: сцену и, если открыто меню, наложение поверх неё.</summary>
-    private void RenderFrame(double nowSeconds)
+    private void RenderFrame(double nowSeconds, MotionDetail motion = MotionDetail.Full)
     {
         _renderer.Render(
             _framebuffer,
@@ -484,13 +608,14 @@ internal sealed class DoomGame
             _projectiles,
             nowSeconds,
             _projectiles.FlashIntensity,
-            _projectiles.FlashColor);
+            _projectiles.FlashColor,
+            motion);
 
         if (GameSettings.Current.ShowFps)
-            HudRenderer.DrawFps(_framebuffer, (int)Math.Round(_fps));
+            _renderer.Hud.DrawFps(_framebuffer, (int)Math.Round(_fps));
 
         if (_screen != GameScreen.Playing)
-            MenuRenderer.Draw(_framebuffer, _menu, _player, _assets);
+            MenuRenderer.Draw(_framebuffer, _menu, _player, _assets, nowSeconds);
     }
 
     /// <summary>Открывает меню-паузу и освобождает курсор, чтобы мышью можно было выбирать пункты.</summary>
@@ -562,24 +687,27 @@ internal sealed class DoomGame
     {
         GameSettings.Current.Save();
 
-        // Качество графики: масштаб терминала / шрифт + пересчёт окна.
-        _terminal.ApplyQualityOnFly();
+        // Качество графики: масштаб терминала / шрифт + пересчёт окна. Пока терминал
+        // перестраивается, кадры не шлём; снимок отправленного больше не соответствует
+        // экрану — следующий кадр уйдёт полным.
+        _pipeline.Exclusive(presenter =>
+        {
+            _terminal.ApplyQualityOnFly();
+            presenter.Reset();
+        });
 
         // Угол обзора зашит в вьюпорт — пересоздаём его под новые настройки.
-        _viewport = new Viewport(_framebuffer.Columns, _framebuffer.Rows);
+        _viewport = CreateViewport();
 
         // Захват мыши применится при возврате в игру: сейчас открыто меню,
         // и курсор должен оставаться свободным для навигации по пунктам.
-
-        // Снимок отправленного больше не соответствует экрану — следующий кадр полный.
-        _presenter.Reset();
     }
 
     /// <summary>Возвращает управление игре и применяет новые настройки (например, угол обзора).</summary>
     private void ResumeGame()
     {
         _screen = GameScreen.Playing;
-        _viewport = new Viewport(_framebuffer.Columns, _framebuffer.Rows);
+        _viewport = CreateViewport();
         _previousFrameTime = _totalTimer.Elapsed.TotalSeconds;
 
         GameSettings.Current.Save();
@@ -595,44 +723,20 @@ internal sealed class DoomGame
             _mouse.EndCapture();
     }
 
-    /// <summary>Обновляет состояние игрока. Возвращает <c>true</c>, если игрок что-то сделал.</summary>
+    /// <summary>Обновляет игрока, двери и снаряды. Возвращает <c>true</c>, если игрок что-то сделал.</summary>
     private bool UpdateWorld(double deltaSeconds, double nowSeconds, long nowMs)
     {
         // Скорости берём из НАСТРОЕК (а не из констант GameConfig): иначе ползунки
         // в меню ни на что не влияли — игра всегда ходила с заводскими параметрами.
-        double move = GameSettings.Current.MoveSpeed * deltaSeconds;
         double rotate = GameSettings.Current.RotationSpeed * deltaSeconds;
-
         bool anyInput = false;
-        bool isMoving = false;
 
-        if (IsHeld(ConsoleKey.W, nowMs) || IsHeld(ConsoleKey.UpArrow, nowMs))
-        {
-            _player.Move(_level, _player.Angle, move);
-            anyInput = true;
-            isMoving = true;
-        }
-
-        if (IsHeld(ConsoleKey.S, nowMs) || IsHeld(ConsoleKey.DownArrow, nowMs))
-        {
-            _player.Move(_level, _player.Angle, -move);
-            anyInput = true;
-            isMoving = true;
-        }
-
-        if (IsHeld(ConsoleKey.A, nowMs))
-        {
-            _player.Move(_level, _player.Angle - Math.PI / 2, move);
-            anyInput = true;
-            isMoving = true;
-        }
-
-        if (IsHeld(ConsoleKey.D, nowMs))
-        {
-            _player.Move(_level, _player.Angle + Math.PI / 2, move);
-            anyInput = true;
-            isMoving = true;
-        }
+        double forward = (IsHeld(ConsoleKey.W, nowMs) || IsHeld(ConsoleKey.UpArrow, nowMs) ? 1 : 0)
+                         - (IsHeld(ConsoleKey.S, nowMs) || IsHeld(ConsoleKey.DownArrow, nowMs) ? 1 : 0);
+        double strafe = (IsHeld(ConsoleKey.D, nowMs) ? 1 : 0) - (IsHeld(ConsoleKey.A, nowMs) ? 1 : 0);
+        bool jump = IsHeld(ConsoleKey.Spacebar, nowMs);
+        bool isMoving = forward != 0 || strafe != 0;
+        anyInput |= isMoving || jump;
 
         if (IsHeld(ConsoleKey.LeftArrow, nowMs))
         {
@@ -646,11 +750,9 @@ internal sealed class DoomGame
             anyInput = true;
         }
 
-        // Горизонтальный сдвиг мыши поворачивает камеру, вертикальный — наклоняет взгляд;
-        // левая кнопка стреляет (как Space).
+        // Горизонтальный сдвиг мыши поворачивает камеру, вертикальный — наклоняет взгляд.
         if (_mouse.DeltaX != 0 || _mouse.DeltaY != 0)
         {
-            // Чувствительность — из настроек, чтобы ползунок действовал сразу.
             _player.Turn(_mouse.DeltaX * GameSettings.Current.MouseSensitivity);
 
             // Мышь вверх (DeltaY < 0) — взгляд вверх, без инверсии.
@@ -658,7 +760,18 @@ internal sealed class DoomGame
             anyInput = true;
         }
 
-        bool firePressed = IsHeld(ConsoleKey.Spacebar, nowMs) || _mouse.LeftButton;
+        foreach (Door door in _level.Doors)
+            door.Update(deltaSeconds);
+
+        _player.Simulate(_level, forward, strafe, jump, GameSettings.Current.MoveSpeed, deltaSeconds);
+
+        // Упал за край мира — обратно на старт.
+        if (_player.Z < -30)
+            _player.PlaceAt(_level.StartX, _level.StartY, _level.StartZ, _level.StartAngle);
+
+        // Стрельба — левая кнопка мыши или F (пробел теперь — прыжок).
+        bool firePressed = _mouse.LeftButton || IsHeld(ConsoleKey.F, nowMs);
+        _player.SetTrigger(firePressed, nowSeconds);
         if (firePressed && _player.TryFire(nowSeconds, out WeaponInfo info))
         {
             FireWeapon(info);
@@ -675,12 +788,57 @@ internal sealed class DoomGame
         _projectiles.Update(deltaSeconds, _level);
 
         // Покачивание оружия можно отключить в настройках: амплитуда плавно гаснет.
+        bool walking = isMoving && _player.OnGround;
         if (GameSettings.Current.WeaponBob)
-            _player.UpdateWeaponBob(deltaSeconds, isMoving);
+            _player.UpdateWeaponBob(deltaSeconds, walking);
         else if (_player.BobIntensity > 0.0001)
             _player.UpdateWeaponBob(deltaSeconds, false);
 
         return anyInput;
+    }
+
+    /// <summary>Глаза игрока и направление взгляда (курс + наклон).</summary>
+    private (Vec3 Eye, Vec3 Direction) ViewRay(double yawOffset = 0, double pitchOffset = 0) =>
+        (new Vec3(_player.X, _player.Y, _player.EyeZ),
+            Vec3.FromAngles(_player.Angle + yawOffset, _player.Pitch + pitchOffset));
+
+    /// <summary>
+    ///     «Использовать» (E): дверь, на которую смотрит игрок, — по лучу взгляда или ближайшая
+    ///     перед ним в пределах досягаемости. Створки одной группы открываются вместе.
+    /// </summary>
+    private void UseDoor()
+    {
+        (Vec3 eye, Vec3 direction) = ViewRay();
+        Door? best = null;
+        double bestScore = double.MaxValue;
+
+        foreach (Door door in _level.Doors)
+        {
+            Vec3 toDoor = door.Center - eye;
+            double distance = toDoor.Length;
+            if (distance > GameConfig.UseRange + door.Width)
+                continue;
+
+            double facing = toDoor.Normalized.Dot(direction);
+            if (facing < 0.3)
+                continue;
+
+            double score = distance * (2 - facing);
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = door;
+            }
+        }
+
+        if (best is null)
+            return;
+
+        foreach (Door door in _level.Doors)
+        {
+            if (door.Group == best.Group)
+                door.Toggle(_player.X, _player.Y);
+        }
     }
 
     /// <summary>Обрабатывает состоявшийся выстрел: рукопашная, мгновенные лучи или снаряд.</summary>
@@ -692,8 +850,9 @@ internal sealed class DoomGame
         }
         else if (info.Projectile != ProjectileKind.None)
         {
-            // Снаряд вылетает туда, куда смотрит ствол, включая наклон вверх/вниз.
-            _projectiles.Launch(info.Projectile, _player.X, _player.Y, _player.Angle, _player.Pitch);
+            // Снаряд вылетает из глаз строго в прицел: туда, куда смотрит игрок (с наклоном).
+            (Vec3 eye, Vec3 direction) = ViewRay();
+            _projectiles.Launch(info.Projectile, eye, direction);
         }
         else
         {
@@ -704,7 +863,7 @@ internal sealed class DoomGame
         _projectiles.AddFlash(info.MuzzleFlash, info.MuzzleFlashSeconds + 0.06, info.MuzzleFlashColor);
     }
 
-    /// <summary>Мгновенный выстрел: каждая дробинка оставляет искру на стене.</summary>
+    /// <summary>Мгновенный выстрел: каждая дробинка — луч из глаз; искра там, где он упёрся в мир.</summary>
     private void FireHitscan(WeaponInfo info)
     {
         for (int pellet = 0; pellet < info.Pellets; pellet++)
@@ -715,39 +874,39 @@ internal sealed class DoomGame
 
             // Разброс детерминированный: одно и то же число выстрелов даёт ту же картинку.
             double jitter = (SpreadNoise.Unit(pellet, _shotCounter) - 0.5) * info.Spread * 0.6;
-            double angle = _player.Angle + spreadOffset + jitter;
+            double vertical = info.Pellets > 1 ? (SpreadNoise.Unit(_shotCounter, pellet) - 0.5) * info.Spread * 0.5 : 0;
 
-            RayHit hit = Raycaster.Cast(_level, _player.X, _player.Y, angle);
-            if (hit.TileType == 0)
-                continue;
-
-            _projectiles.SpawnHitSpark(ImpactKind.BulletSpark, _player.X, _player.Y, angle, hit.Distance);
+            (Vec3 eye, Vec3 direction) = ViewRay(spreadOffset + jitter, vertical);
+            if (_level.RayCast(eye, direction, 200, out RayHit hit))
+                _projectiles.SpawnHitSpark(ImpactKind.BulletSpark, hit.Point, hit.Normal);
         }
 
         _shotCounter++;
     }
 
-    /// <summary>Рукопашная атака: искра появляется, если стена ближе вытянутой руки.</summary>
+    /// <summary>Рукопашная атака: искра появляется, если поверхность ближе вытянутой руки.</summary>
     private void FireMelee()
     {
-        RayHit hit = Raycaster.Cast(_level, _player.X, _player.Y, _player.Angle);
-        if (hit.TileType == 0 || hit.Distance > GameConfig.MeleeRange)
-            return;
-
-        _projectiles.SpawnHitSpark(ImpactKind.MeleeSpark, _player.X, _player.Y, _player.Angle, hit.Distance);
+        (Vec3 eye, Vec3 direction) = ViewRay();
+        if (_level.RayCast(eye, direction, GameConfig.MeleeRange, out RayHit hit))
+            _projectiles.SpawnHitSpark(ImpactKind.MeleeSpark, hit.Point, hit.Normal);
     }
 
-    private bool IsHeld(ConsoleKey key, long nowMs) => _keyboard.IsHeld(key, nowMs);
+    /// <summary>Удерживается ли клавиша. Без фокуса окна — нет: опрос клавиатуры глобальный.</summary>
+    private bool IsHeld(ConsoleKey key, long nowMs) => _hasFocus && _keyboard.IsHeld(key, nowMs);
 
     /// <summary>Ограничивает частоту кадров ~60 FPS.</summary>
     private void SleepToTargetFrameRate()
     {
-        double elapsedMs = _frameTimer.Elapsed.TotalMilliseconds;
-        if (elapsedMs >= GameConfig.TargetFrameMs)
-            return;
+        // Thread.Sleep точен до ~1 мс только с timeBeginPeriod(1) (см. Run); остаток кадра
+        // досыпаем короткими паузами, чтобы не проспать дедлайн.
+        while (true)
+        {
+            double remainingMs = GameConfig.TargetFrameMs - _frameTimer.Elapsed.TotalMilliseconds;
+            if (remainingMs <= 0.25)
+                return;
 
-        int sleepMs = (int)(GameConfig.TargetFrameMs - elapsedMs);
-        if (sleepMs > 0)
-            Thread.Sleep(sleepMs);
+            Thread.Sleep(remainingMs > 2.0 ? (int)(remainingMs - 1.0) : 0);
+        }
     }
 }

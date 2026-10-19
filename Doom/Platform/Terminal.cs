@@ -10,7 +10,23 @@ namespace Doom.Platform;
 /// </summary>
 internal sealed class Terminal
 {
+    /// <summary>Процессы, которым может принадлежать окно терминала (запасная проверка фокуса).</summary>
+    private static readonly string[] TerminalProcesses =
+    {
+        "WindowsTerminal", "OpenConsole", "conhost", "cmd", "powershell", "pwsh", "wt"
+    };
+
     private readonly Stream _stdout;
+
+    /// <summary>
+    ///     Запись идёт из двух потоков (кадры — из потока вывода, служебные команды — из
+    ///     главного), поэтому каждая запись атомарна: последовательности не перемешиваются.
+    /// </summary>
+    private readonly object _writeGate = new();
+
+    private uint _foregroundPid;
+    private bool _foregroundIsTerminal;
+    private int _consoleIsReal = -1;
 
     private uint _originalInputMode;
     private bool _inputModeSaved;
@@ -46,6 +62,91 @@ internal sealed class Terminal
         }
 
         _stdout = Console.OpenStandardOutput();
+        EnableVirtualTerminalOutput();
+    }
+
+    /// <summary>
+    ///     Включает разбор VT-последовательностей в консоли. Windows Terminal делает это сам,
+    ///     а классическая консоль — не всегда (зависит от настроек системы): без этого режима
+    ///     весь кадр вывелся бы мусором из escape-кодов.
+    /// </summary>
+    private static void EnableVirtualTerminalOutput()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            IntPtr handle = NativeMethods.GetStdHandle(NativeMethods.StdOutputHandle);
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+                return;
+
+            if (NativeMethods.GetConsoleMode(handle, out uint mode)
+                && (mode & NativeMethods.EnableVirtualTerminalProcessing) == 0)
+            {
+                NativeMethods.SetConsoleMode(handle, mode | NativeMethods.EnableVirtualTerminalProcessing);
+            }
+        }
+        catch
+        {
+            // Вывод перенаправлен — режим консоли не нужен.
+        }
+    }
+
+    /// <summary>
+    ///     Окно игры сейчас на переднем плане? Клавиши и кнопки мыши опрашиваются через
+    ///     GetAsyncKeyState — глобально, — поэтому без этой проверки игрок ходил и стрелял,
+    ///     пока пользователь печатал в другом окне. Если своё окно не найдено, проверяем
+    ///     хотя бы, что активно окно терминала или оболочки.
+    /// </summary>
+    public bool IsForeground()
+    {
+        if (!OperatingSystem.IsWindows())
+            return true;
+
+        IntPtr foreground = NativeMethods.GetForegroundWindow();
+        if (foreground == IntPtr.Zero)
+            return false;
+
+        if (_terminalWindow != IntPtr.Zero)
+            return foreground == _terminalWindow;
+
+        if (_consoleIsReal < 0)
+            _consoleIsReal = IsRealConsoleWindow() ? 1 : 0;
+
+        if (_consoleIsReal == 1)
+            return foreground == NativeMethods.GetConsoleWindow();
+
+        NativeMethods.GetWindowThreadProcessId(foreground, out uint processId);
+        if (processId == 0)
+            return false;
+
+        if (processId != _foregroundPid)
+        {
+            _foregroundPid = processId;
+            _foregroundIsTerminal = IsTerminalProcess(processId);
+        }
+
+        return _foregroundIsTerminal;
+    }
+
+    private static bool IsTerminalProcess(uint processId)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById((int)processId);
+            foreach (string name in TerminalProcesses)
+            {
+                if (process.ProcessName.Contains(name, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        catch
+        {
+            // Процесс уже завершился или недоступен.
+        }
+
+        return false;
     }
 
     /// <summary>Игра запущена в Windows Terminal?</summary>
@@ -75,30 +176,25 @@ internal sealed class Terminal
     /// <summary>Записывает управляющую последовательность (только ASCII).</summary>
     public void Write(string escapeSequence)
     {
-        try
-        {
-            byte[] bytes = Encoding.ASCII.GetBytes(escapeSequence);
-            _stdout.Write(bytes, 0, bytes.Length);
-        }
-        catch
-        {
-            // Вывод может быть закрыт: молча игнорируем, чтобы не ронять игру.
-        }
+        byte[] bytes = Encoding.ASCII.GetBytes(escapeSequence);
+        Write(bytes, bytes.Length);
     }
 
-    /// <summary>Записывает подготовленный пакет байт (используется рендером кадра).</summary>
+    /// <summary>Записывает подготовленный пакет байт (используется выводом кадра).</summary>
     public void Write(byte[] buffer, int length)
     {
-        try
+        lock (_writeGate)
         {
-            _stdout.Write(buffer, 0, length);
-        }
-        catch
-        {
+            try
+            {
+                _stdout.Write(buffer, 0, length);
+            }
+            catch
+            {
+                // Вывод может быть закрыт: молча игнорируем, чтобы не ронять игру.
+            }
         }
     }
-
-    public void HideCursor() => Write(Ansi.HideCursor);
 
     public void ClearScreen() => Write(Ansi.ClearScreen + Ansi.Home);
 

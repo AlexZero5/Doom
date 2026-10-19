@@ -110,6 +110,29 @@ internal sealed class PixelCanvas
         }
     }
 
+    /// <summary>Картинка с целым увеличением (прозрачные пиксели пропускаются).</summary>
+    public void Image(Texture texture, int x, int y, int scale) =>
+        Tile(texture, 0, 0, texture.Width, texture.Height, x, y, texture.Width * scale, texture.Height * scale, scale);
+
+    /// <summary>
+    ///     Заливает прямоугольник (в пикселях холста) участком картинки, повторяя его: так
+    ///     тянутся края и середина рамки-панели и дорожка ползунка.
+    /// </summary>
+    public void Tile(Texture texture, int sourceX, int sourceY, int sourceWidth, int sourceHeight,
+        int x, int y, int width, int height, int scale)
+    {
+        if (sourceWidth <= 0 || sourceHeight <= 0)
+            return;
+
+        for (int dy = 0; dy < height; dy++)
+        for (int dx = 0; dx < width; dx++)
+        {
+            int argb = texture.SamplePixel(sourceX + dx / scale % sourceWidth, sourceY + dy / scale % sourceHeight);
+            if (!Texture.IsTransparent(argb))
+                Pixel(x + dx, y + dy, argb & 0xFFFFFF);
+        }
+    }
+
     /// <summary>Ширина строки при отрисовке с увеличением <paramref name="scale" />.</summary>
     public static int Measure(string text, int scale = 1) => PixelFont.Measure(text) * scale;
 

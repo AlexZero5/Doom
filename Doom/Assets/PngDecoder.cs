@@ -26,7 +26,7 @@ internal static class PngDecoder
         // ============================================================
         //   Разбор чанков
         // ============================================================
-        int width = 0, height = 0, colorType = 0, bitDepth = 0;
+        int width = 0, height = 0, colorType = 0, bitDepth = 0, interlace = 0;
         byte[]? palette = null;
         byte[]? transparency = null;
 
@@ -55,6 +55,7 @@ internal static class PngDecoder
                     height = BigEndian(data, dataStart + 4);
                     bitDepth = data[dataStart + 8];
                     colorType = data[dataStart + 9];
+                    interlace = data[dataStart + 12];
                     headerRead = true;
                     break;
 
@@ -93,6 +94,12 @@ internal static class PngDecoder
         if (bitDepth != 8)
         {
             error = $"глубина {bitDepth} бит не поддерживается — пересохраните как 8 бит";
+            return false;
+        }
+
+        if (interlace != 0)
+        {
+            error = "interlaced PNG не поддерживается — пересохраните без чересстрочности";
             return false;
         }
 

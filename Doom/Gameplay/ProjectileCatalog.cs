@@ -53,11 +53,11 @@ internal static class ProjectileCatalog
     private static readonly ProjectileInfo[] Projectiles =
     {
         default,
-        new(speed: 9.0, lifetime: 6.0, trailSeconds: 0.055, trailImpact: ImpactKind.RocketTrail,
+        new(speed: 24.0, lifetime: 6.0, trailSeconds: 0.055, trailImpact: ImpactKind.RocketTrail,
             impact: ImpactKind.RocketExplosion, spawnZCenter: 0.40, bandHalf: 0.08),
-        new(speed: 14.0, lifetime: 4.0, trailSeconds: 0.035, trailImpact: ImpactKind.PlasmaTrail,
+        new(speed: 36.0, lifetime: 4.0, trailSeconds: 0.035, trailImpact: ImpactKind.PlasmaTrail,
             impact: ImpactKind.PlasmaImpact, spawnZCenter: 0.38, bandHalf: 0.08),
-        new(speed: 8.0, lifetime: 6.0, trailSeconds: 0.09, trailImpact: ImpactKind.BfgTrail,
+        new(speed: 21.0, lifetime: 6.0, trailSeconds: 0.09, trailImpact: ImpactKind.BfgTrail,
             impact: ImpactKind.BfgImpact, spawnZCenter: 0.42, bandHalf: 0.20)
     };
 

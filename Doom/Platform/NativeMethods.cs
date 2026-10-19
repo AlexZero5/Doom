@@ -58,7 +58,6 @@ internal static class NativeMethods
 
     /// <summary>Клавиша «−» основной части клавиатуры (в терминале ей соответствует Ctrl+−).</summary>
     public const ushort VirtualKeyOemMinus = 0xBD;
-    public const ushort VirtualKeyOemPlus = 0xBB;
 
     /// <summary>
     ///     Входит в объединение и нужен, чтобы размер <see cref="Input" /> совпал с нативным
@@ -335,11 +334,30 @@ internal static class NativeMethods
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
+    // Структура объявлена в Unicode — значит, и функции нужны W-версии: иначе вызывалась
+    // ANSI-версия, и имя процесса в записи читалось мусором.
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW")]
     public static extern bool Process32First(IntPtr snapshot, ref ProcessEntry32 entry);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "Process32NextW")]
     public static extern bool Process32Next(IntPtr snapshot, ref ProcessEntry32 entry);
+
+    // ============================================================
+    //   Таймер и режим вывода
+    // ============================================================
+
+    /// <summary>
+    ///     Разрешение системного таймера. По умолчанию Windows округляет Thread.Sleep до
+    ///     ~15.6 мс: «поспать 5 мс» превращалось в 15, и цикл не мог держать 60 кадров.
+    /// </summary>
+    [DllImport("winmm.dll")]
+    public static extern uint timeBeginPeriod(uint period);
+
+    [DllImport("winmm.dll")]
+    public static extern uint timeEndPeriod(uint period);
+
+    /// <summary>Режим вывода консоли: обработка VT-последовательностей.</summary>
+    public const uint EnableVirtualTerminalProcessing = 0x0004;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr handle);

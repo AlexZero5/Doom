@@ -9,41 +9,17 @@ internal static class GameConfig
     // ============================================================
     //   Обзор и рендер
     // ============================================================
-    public const double FieldOfView = Math.PI / 3;
-
-    public const double HalfFieldOfView = FieldOfView * 0.5;
+    /// <summary>
+    ///     Горизонтальный угол обзора по умолчанию. Камера честная (квадратные пиксели), поэтому
+    ///     на широком терминале 90° по горизонтали дают ~55° по вертикали.
+    /// </summary>
+    public const double FieldOfView = Math.PI / 2;
 
     /// <summary>Угол обзора в градусах — значение по умолчанию для настроек.</summary>
     public const double FieldOfViewDegrees = FieldOfView * 180.0 / Math.PI;
 
-    /// <summary>Количество вертикальных сэмплов текстуры стены.</summary>
-    public const int TextureSamples = 2;
-
-    /// <summary>Максимум шагов DDA при трассировке луча.</summary>
-    public const int MaxRaySteps = 512;
-
-    /// <summary>
-    ///     Предел взгляда вверх/вниз (радианы). Реальный предел задаёт сдвиг горизонта
-    ///     (полторы высоты кадра, см. Viewport.HorizonPixels) — при его достижении видно
-    ///     сплошной потолок или сплошной пол. Запас по радианам нужен, чтобы предел
-    ///     достигался при любой ширине кадра.
-    /// </summary>
-    public const double MaxPitchRadians = 1.1;
-
-    /// <summary>Максимум стеновых сегментов в одном луче (низкие стены пропускают луч выше себя).</summary>
-    public const int MaxWallHitsPerRay = 4;
-
-    // Текстуры полов и потолков — номера файлов в assets/walls/:
-    // 6 — трава, 7 — металл, 8 — земля; потолки берутся текстурой стены здания.
-
-    private const int WideScreenColumns = 200;
-    private const int MediumScreenColumns = 100;
-
-    /// <summary>Количество лучей на колонку: чем уже кадр, тем выше качество сглаживания.</summary>
-    public static int RaysPerColumn(int columns) =>
-        columns > WideScreenColumns ? 2
-        : columns > MediumScreenColumns ? 4
-        : 6;
+    /// <summary>Предел взгляда вверх/вниз: почти 90° — можно смотреть прямо в пол и в небо.</summary>
+    public const double MaxPitchRadians = 89.0 * Math.PI / 180.0;
 
     // ============================================================
     //   Консоль
@@ -52,7 +28,6 @@ internal static class GameConfig
     // заведомо большее число ячеек, чем влезает на экран, — от такого запроса кадр
     // рисовался «мимо» рамки. Игра подстраивается под фактическое окно.
 
-    public const short DesiredFontSize = 8;
     public const short MinimumFontSize = 4;
 
     /// <summary>Верхняя граница подбора шрифта, если точный размер для качества не поддерживается.</summary>
@@ -66,7 +41,6 @@ internal static class GameConfig
 
     public const int FallbackRows = 40;
 
-    public const int StartupDelayMs = 300;
     public const int ResizeDelayMs = 200;
     public const int ZoomHintMilliseconds = 4000;
     public const int ZoomHintPollMs = 50;
@@ -100,17 +74,42 @@ internal static class GameConfig
     // ============================================================
     //   Игрок
     // ============================================================
-    public const double MoveSpeed = 3.0;
+    /// <summary>Скорость ходьбы, м/с.</summary>
+    public const double MoveSpeed = 5.5;
     public const double RotationSpeed = 2.0;
 
-    public const double PickupRadius = 0.45;
+    public const double PickupRadius = 0.7;
 
-    /// <summary>Стартовая позиция игрока и направление взгляда.</summary>
-    public const double StartX = 2.5;
+    /// <summary>Радиус игрока (метры): дверной проём в метр проходим с запасом.</summary>
+    public const double PlayerRadius = 0.28;
 
-    public const double StartY = 2.5;
+    /// <summary>Рост (метры): столько места нужно над ногами.</summary>
+    public const double PlayerHeight = 1.75;
 
-    public const double StartAngle = 0.4;
+    /// <summary>Высота глаз над ногами.</summary>
+    public const double EyeHeight = 1.6;
+
+    /// <summary>Уступ, на который игрок поднимается без прыжка (ступени, порог, бордюр).</summary>
+    public const double StepHeight = 0.42;
+
+    /// <summary>Ускорение свободного падения (м/с², «игровое» — чуть больше настоящего).</summary>
+    public const double Gravity = 19.0;
+
+    /// <summary>Скорость отрыва при прыжке: высота прыжка ≈ v² / 2g ≈ 1.1 м.</summary>
+    public const double JumpSpeed = 6.5;
+
+    /// <summary>Скорость подъёма по вертикальной лестнице.</summary>
+    public const double ClimbSpeed = 2.4;
+
+    /// <summary>Дальность «использовать» (двери).</summary>
+    public const double UseRange = 2.0;
+
+    /// <summary>Стартовая позиция игрока и направление взгляда (юг площади, лицом к башне).</summary>
+    public const double StartX = 16.5;
+
+    public const double StartY = 20.5;
+
+    public const double StartAngle = -Math.PI / 2;
 
     public const int InitialBullets = 50;
 
@@ -131,13 +130,13 @@ internal static class GameConfig
     public const double WeaponRaiseOffset = 11.0;
 
     /// <summary>Дальность рукопашной атаки в клетках.</summary>
-    public const double MeleeRange = 1.25;
+    public const double MeleeRange = 1.6;
 
     /// <summary>Насколько искра отодвигается от стены, чтобы её не перекрывала грань.</summary>
     public const double SparkOffsetFromWall = 0.07;
 
     /// <summary>На каком расстоянии от игрока рождается снаряд.</summary>
-    public const double ProjectileSpawnOffset = 0.34;
+    public const double ProjectileSpawnOffset = 0.5;
 
     /// <summary>Максимальный шаг проверки столкновения снаряда со стеной.</summary>
     public const double MaxProjectileStep = 0.08;

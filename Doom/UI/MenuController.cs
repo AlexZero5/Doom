@@ -32,13 +32,15 @@ internal enum MenuCommand
 internal sealed class MenuController
 {
     private const int MainItemCount = 4;
-    private const int SettingsItemCount = 10;
+    private const int SettingsItemCount = 13;
     private const int CheatsItemCount = 1 + WeaponCatalog.Count + 4;
 
-    private static readonly string[] QualityNames =
-    {
-        "Низкое", "Среднее", "Высокое", "Очень высокое", "Ультра", "Экстрим", "Максимум"
-    };
+    /// <summary>
+    ///     Размер трёхмерного вида на экране (столбцы × пиксельные строки) — игра сообщает его
+    ///     при каждом изменении окна, чтобы в настройках было видно настоящее разрешение.
+    /// </summary>
+    public static (int Columns, int PixelRows) ViewSize { get; set; } = (320, 180);
+
 
     private static readonly string[] WeaponNames =
     {
@@ -387,12 +389,13 @@ internal sealed class MenuController
     {
         GameSettings settings = GameSettings.Current;
 
+        (int width, int height) = Rendering.SceneRenderer.InternalSize(ViewSize.Columns, ViewSize.PixelRows, settings.RenderScale);
         _entries.Add(new MenuEntry
         {
-            Label = "Качество графики",
+            Label = "Разрешение",
             Kind = MenuEntryKind.Option,
-            Id = MenuEntryId.Quality,
-            Value = QualityNames[(int)settings.Quality]
+            Id = MenuEntryId.Resolution,
+            Value = $"{width}x{height} ({100 / settings.RenderScale:0}%)"
         });
 
         _entries.Add(Slider("Чувствительность мыши", MenuEntryId.MouseSensitivity, settings.MouseSensitivity,
@@ -405,7 +408,10 @@ internal sealed class MenuController
             SettingsRanges.FieldOfViewMin, SettingsRanges.FieldOfViewMax, "0"));
 
         _entries.Add(Toggle("Захват мыши", MenuEntryId.CaptureMouse, settings.CaptureMouse));
+        _entries.Add(Toggle("Скрывать курсор", MenuEntryId.HideCursor, settings.HideCursor));
+        _entries.Add(Toggle("Прицел", MenuEntryId.Crosshair, settings.Crosshair));
         _entries.Add(Toggle("Покачивание оружия", MenuEntryId.WeaponBob, settings.WeaponBob));
+        _entries.Add(Toggle("Грубее в движении", MenuEntryId.StrongMotion, settings.StrongMotionSimplify));
         _entries.Add(Toggle("Счётчик FPS", MenuEntryId.ShowFps, settings.ShowFps));
         _entries.Add(Toggle("Авто-отдаление при старте", MenuEntryId.AutoZoom, settings.AutoZoom));
         _entries.Add(Toggle("Разворачивать окно", MenuEntryId.MaximizeWindow, settings.AutoMaximizeWindow));
@@ -493,12 +499,16 @@ internal sealed class MenuController
     {
         switch (entry.Id)
         {
-            case MenuEntryId.Quality:
-                // Без закольцованности: с «Низкого» влево раньше попадали сразу в самый
-                // мелкий масштаб («Максимум») — это и выглядело как случайный перескок.
-                GameSettings.Current.Quality = (GraphicsQuality)Math.Clamp(
-                    (int)GameSettings.Current.Quality + direction, 0, QualityNames.Length - 1);
+            case MenuEntryId.Resolution:
+            {
+                // Вправо — чётче (меньше делитель), влево — грубее; без закольцовывания.
+                double[] scales = SettingsRanges.RenderScales;
+                int current = Array.IndexOf(scales, GameSettings.Current.RenderScale);
+                if (current < 0)
+                    current = 3;
+                GameSettings.Current.RenderScale = scales[Math.Clamp(current - direction, 0, scales.Length - 1)];
                 break;
+            }
 
             case MenuEntryId.MouseSensitivity:
                 GameSettings.Current.MouseSensitivity = Step(GameSettings.Current.MouseSensitivity,
@@ -559,8 +569,20 @@ internal sealed class MenuController
             case MenuEntryId.Quit:
                 return MenuCommand.Quit;
 
-            case MenuEntryId.Quality:
+            case MenuEntryId.Resolution:
                 AdjustEntry(entry, 1, player);
+                return MenuCommand.Redraw;
+
+            case MenuEntryId.HideCursor:
+                GameSettings.Current.HideCursor = !GameSettings.Current.HideCursor;
+                return MenuCommand.Redraw;
+
+            case MenuEntryId.Crosshair:
+                GameSettings.Current.Crosshair = !GameSettings.Current.Crosshair;
+                return MenuCommand.Redraw;
+
+            case MenuEntryId.StrongMotion:
+                GameSettings.Current.StrongMotionSimplify = !GameSettings.Current.StrongMotionSimplify;
                 return MenuCommand.Redraw;
 
             case MenuEntryId.CaptureMouse:

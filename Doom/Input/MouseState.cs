@@ -1,5 +1,3 @@
-using System.Diagnostics;
-using Doom.Configuration;
 using Doom.Platform;
 using Point = Doom.Platform.NativeMethods.Point;
 
@@ -12,12 +10,6 @@ namespace Doom.Input;
 /// </summary>
 internal sealed class MouseState
 {
-    /// <summary>Процессы, владеющие окном терминала: при них захват курсора уместен.</summary>
-    private static readonly string[] TerminalProcesses =
-    {
-        "WindowsTerminal", "OpenConsole", "conhost", "cmd", "powershell", "pwsh", "wt"
-    };
-
     private bool _initialized;
     private int _lastX;
     private int _lastY;
@@ -25,12 +17,15 @@ internal sealed class MouseState
     private bool _capturing;
     private bool _pinning;
     private bool _cursorHidden;
+
+    /// <summary>Шторка, прячущая курсор и клики от терминала (null — не прятать).</summary>
+    public CursorShield? Shield { get; set; }
+
+    /// <summary>Прятать ли курсор при захвате (настройка).</summary>
+    public bool HideCursor { get; set; } = true;
     private Point _origin;
     private Point _savedCursor;
     private bool _savedCursorValid;
-
-    private uint _foregroundPid;
-    private bool _foregroundIsTerminal;
 
     /// <summary>Сдвиг курсора по горизонтали за кадр (в пикселях).</summary>
     public int DeltaX { get; private set; }
@@ -40,9 +35,6 @@ internal sealed class MouseState
 
     /// <summary>Левая кнопка мыши удерживается (для стрельбы).</summary>
     public bool LeftButton { get; private set; }
-
-    /// <summary>Правая кнопка мыши удерживается.</summary>
-    public bool RightButton { get; private set; }
 
     /// <summary>Включает захват: во время игры курсор будет скрыт и удержан на месте.</summary>
     public void BeginCapture()
@@ -64,7 +56,7 @@ internal sealed class MouseState
     {
         if (_cursorHidden)
         {
-            NativeMethods.ShowCursor(true);
+            Shield?.Hide();
             _cursorHidden = false;
         }
 
@@ -76,21 +68,19 @@ internal sealed class MouseState
         _savedCursorValid = false;
     }
 
-    /// <summary>Читает состояние мыши за текущий кадр.</summary>
-    public void Update()
+    /// <summary>
+    ///     Читает состояние мыши за текущий кадр. <paramref name="hasFocus" /> — окно игры
+    ///     на переднем плане: без фокуса кнопки и сдвиг игнорируются (клик в браузере не должен
+    ///     стрелять), а захват курсора отпускается, чтобы не «красть» его у другой программы.
+    /// </summary>
+    public void Update(bool hasFocus)
     {
         DeltaX = 0;
         DeltaY = 0;
+        LeftButton = false;
 
         if (!OperatingSystem.IsWindows())
-        {
-            LeftButton = false;
-            RightButton = false;
             return;
-        }
-
-        LeftButton = IsButtonDown(NativeMethods.VirtualKeyLButton);
-        RightButton = IsButtonDown(NativeMethods.VirtualKeyRButton);
 
         if (!NativeMethods.GetCursorPos(out Point pos))
             return;
@@ -103,22 +93,39 @@ internal sealed class MouseState
             return;
         }
 
-        // Захват держим только пока на переднем плане окно терминала, чтобы не «красть»
-        // курсор у пользователя, переключившегося в другую программу.
-        bool captureActive = _capturing && IsTerminalForeground();
-
-        if (captureActive)
+        if (!hasFocus)
         {
-            if (!_cursorHidden)
+            ReleasePin();
+            _lastX = pos.X;
+            _lastY = pos.Y;
+            return;
+        }
+
+        LeftButton = (NativeMethods.GetAsyncKeyState(NativeMethods.VirtualKeyLButton) & 0x8000) != 0;
+
+        if (_capturing)
+        {
+            if (!HideCursor && _cursorHidden)
             {
-                NativeMethods.ShowCursor(false);
-                _cursorHidden = true;
+                Shield?.Hide();
+                _cursorHidden = false;
             }
 
             if (!_pinning)
             {
+                // Только что получили фокус: точка удержания — там, где курсор сейчас,
+                // а сдвиг этого кадра не считаем (иначе камера дёрнется на весь путь курсора).
                 _origin = pos;
                 _pinning = true;
+                if (HideCursor && Shield is not null)
+                {
+                    Shield.Show(pos.X, pos.Y);
+                    _cursorHidden = true;
+                }
+
+                _lastX = pos.X;
+                _lastY = pos.Y;
+                return;
             }
 
             DeltaX = pos.X - _lastX;
@@ -130,13 +137,7 @@ internal sealed class MouseState
         }
         else
         {
-            if (_cursorHidden)
-            {
-                NativeMethods.ShowCursor(true);
-                _cursorHidden = false;
-            }
-
-            _pinning = false;
+            ReleasePin();
             DeltaX = pos.X - _lastX;
             DeltaY = pos.Y - _lastY;
             _lastX = pos.X;
@@ -144,47 +145,14 @@ internal sealed class MouseState
         }
     }
 
-    private static bool IsButtonDown(int virtualKey) =>
-        (NativeMethods.GetAsyncKeyState(virtualKey) & 0x8000) != 0;
-
-    /// <summary>
-    ///     Проверяет, что окно на переднем плане принадлежит терминалу или оболочке.
-    ///     Имя процесса кэшируется и пересчитывается только при смене активного окна.
-    /// </summary>
-    private bool IsTerminalForeground()
+    private void ReleasePin()
     {
-        IntPtr foreground = NativeMethods.GetForegroundWindow();
-        if (foreground == IntPtr.Zero)
-            return false;
-
-        NativeMethods.GetWindowThreadProcessId(foreground, out uint processId);
-        if (processId == 0)
-            return false;
-
-        if (processId == _foregroundPid)
-            return _foregroundIsTerminal;
-
-        _foregroundPid = processId;
-        _foregroundIsTerminal = MatchesTerminalProcess(processId);
-        return _foregroundIsTerminal;
-    }
-
-    private static bool MatchesTerminalProcess(uint processId)
-    {
-        try
+        if (_cursorHidden)
         {
-            using Process process = Process.GetProcessById((int)processId);
-            foreach (string name in TerminalProcesses)
-            {
-                if (process.ProcessName.Contains(name, StringComparison.OrdinalIgnoreCase))
-                    return true;
-            }
-        }
-        catch
-        {
-            return false;
+            Shield?.Hide();
+            _cursorHidden = false;
         }
 
-        return false;
+        _pinning = false;
     }
 }
